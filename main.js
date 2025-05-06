@@ -72,10 +72,15 @@ import GUI from 'lil-gui';
 // Configuration & Global State
 // =============================================================================
 
+const MAX_ACCEPTED_VERTS = 50000; // NEW: Safety limit for vertex generation
+
 const config = {
     // --- Mathematical Constants ---
     goldenRatio: (1 + Math.sqrt(5)) / 2,
     tau: (1 + Math.sqrt(5)) / 2, // Explicit tau for clarity
+
+    // --- NEW: Symmetry Parameter ---
+    nSym: 5, // Desired n-fold symmetry (≥3)
 
     // --- Basis Vectors (calculated in calculateProjectionMatrices) ---
     parVecs: [], // Physical space basis vectors (2D) - ROWS of P_PHYS
@@ -87,7 +92,7 @@ const config = {
 
     // --- Generation Parameters (UI controllable) ---
     extent: 4,                  // Range [-extent, extent] for 5D lattice search
-    windowShiftInternal: new THREE.Vector3(0, 0, 0), // UI shift for the window center in 3D E_int
+    windowShiftInternal: [0, 0, 0], // NEW: Array for N-2 dimensions. Size will be adapted if needed.
     windowScale: 1.0,                  // NEW: Scale factor for the acceptance window size
 
     // --- Extrusion Parameters (UI controllable) ---
@@ -116,9 +121,7 @@ const config = {
     showFaces: true,            // Toggle visibility for faces
 
     // --- Fixed Parameters ---\
-    dimension: 5, // Dimension of the source lattice Z^d
     physDimension: 2, // Dimension of the physical space R^d_phys
-    intDimension: 3, // Dimension of the internal space R^d_int
     windowPerturbationMagnitude: 1e-6, // Small random offset for window center
     epsilonComparison: 1e-12,          // Small value for floating point comparisons (INCREASED PRECISION)
 
@@ -139,10 +142,15 @@ let gui;
 let guiControllers = {};      // NEW: Object to hold references to specific controllers
 
 // --- Global Generation Data ---
-let acceptedPointsData = []; // Stores { id, lattice(5D), phys(2D), internal(3D) } records
+let acceptedPointsData = []; // Stores { id, lattice(N-D), phys(2D), internal((N-2)-D) } records
 let generatedEdges = [];    // Stores { v1: id1, v2: id2 }
-let generatedFaces = [];    // Stores { vertices: [id0, id1, id2, id3], type: 'thin' | 'thick' }
-let windowPlanes = [];      // Stores { normal: Vec3 (in E_int), offset: number } for the window
+let generatedFaces = [];    // Stores { vertices: [id0, id1, id2, id3], type: string }
+let windowPlanes = [];      // Stores { normal: Float64Array (in E_int), offset: number } for the window
+
+// --- NEW: Global Material Caches ---
+let faceMaterialsCache = {};    // For 2D flat faces
+let domeRoofMaterialsCache = {}; // For 3D dome roofs
+const degenerateMaterialTypeString = 'degenerate'; // Consistent key for degenerate material
 
 // --- Scratch objects for math to reduce GC ---
 const _tmpVec3 = new THREE.Vector3();
@@ -165,11 +173,11 @@ function dot(v1, v2) {
     return sum;
 }
 
-function scale(v, scalar) {
+function vecScale(v, scalar) { // Renamed from scale
     return v.map(x => x * scalar);
 }
 
-function subtract(v1, v2) {
+function vecSubtract(v1, v2) { // Renamed from subtract
     const len = Math.min(v1.length, v2.length);
     const result = new Array(len);
     for (let i = 0; i < len; i++) {
@@ -179,7 +187,7 @@ function subtract(v1, v2) {
 }
 
 
-function add(v1, v2) {
+function vecAdd(v1, v2) { // Renamed from add
     const len = Math.min(v1.length, v2.length);
     const result = new Array(len);
     for (let i = 0; i < len; i++) {
@@ -194,146 +202,191 @@ function normalize(v) {
     if (magnitude < config.epsilonComparison) { // Avoid division by zero
         return v.map(() => 0);
     }
-    return scale(v, 1 / magnitude);
+    return vecScale(v, 1 / magnitude); // Use renamed vecScale
+}
+
+// --- NEW: Internal Space Vector Math Helpers (for Float64Array) ---
+function internalDot(v1, v2) {
+    let sum = 0;
+    const len = Math.min(v1.length, v2.length);
+    for (let i = 0; i < len; i++) {
+        sum += v1[i] * v2[i];
+    }
+    return sum;
+}
+
+function internalLengthSq(v) {
+    return internalDot(v, v);
+}
+
+function internalSubtract(v1, v2, out) {
+    const len = Math.min(v1.length, v2.length, out.length);
+    for (let i = 0; i < len; i++) {
+        out[i] = v1[i] - v2[i];
+    }
+    return out;
 }
 
 /**
- * Calculates orthonormal 2D physical (E_phys) and 3D internal (E_int) space basis vectors
- * for projecting from Z^5 lattice for Penrose tiling.
+ * Calculates orthonormal 2D physical (E_phys) and (N-2)-D internal (E_int) space basis vectors
+ * for projecting from Z^N lattice for generalized n-fold symmetric tiling.
  */
 function calculateProjectionMatrices() {
-    const N = config.dimension; // Should be 5
-    if (N !== 5) console.error("Dimension mismatch: Expected 5 for Penrose setup.");
+    const N = config.nSym;
+    if (N < 3) {
+        console.error(`nSym (N) must be >= 3. Received ${N}. Defaulting to N=5.`);
+        config.nSym = 5; // Fallback to a valid N
+        // Optionally, update GUI display here if possible
+        // guiControllers.nSym?.setValue(5); // Example, if nSym controller is stored
+        // return calculateProjectionMatrices(); // Recurse with corrected N
+    }
+    const internalDim = N - 2;
 
-    console.log("Setting up canonical de Bruijn projection basis...");
+    console.log(`Setting up generic Fourier basis for N=${N} (${internalDim}D internal space)...`);
+    const norm = 1 / Math.sqrt(N);
 
-    // --- Use Explicit Orthogonal de Bruijn Basis (No Gram-Schmidt) ---
-    const P_PHYS_matrix = [[], []]; // 2x5
-    const P_INT_matrix = [[], [], []]; // 3x5
-    const sqrt5 = Math.sqrt(5);
-    const scaleFactor = 1 / sqrt5; // Equivalent to sqrt(2/N) * 1/sqrt(2) ??? Check scaling
-                                    // Let's use 1/sqrt(5) as given in user prompt
-
+    // --- Physical plane (m = 1 Fourier mode) ---
+    const P_PHYS_matrix = [[], []]; // 2xN
     for (let k = 0; k < N; k++) {
-        const angle1 = 2 * Math.PI * k / N; // Phys angle
-        const angle2 = 4 * Math.PI * k / N; // Internal angle (double)
-
-        // Physical space components (COLUMNS of P_PHYS^T = ROWS of P_PHYS)
-        P_PHYS_matrix[0][k] = Math.cos(angle1) * scaleFactor;
-        P_PHYS_matrix[1][k] = Math.sin(angle1) * scaleFactor;
-
-        // Internal space components (COLUMNS of P_INT^T = ROWS of P_INT)
-        P_INT_matrix[0][k] = Math.cos(angle2) * scaleFactor;
-        P_INT_matrix[1][k] = Math.sin(angle2) * scaleFactor;
-        P_INT_matrix[2][k] = 1 * scaleFactor;
+        const theta = 2 * Math.PI * k / N;
+        P_PHYS_matrix[0][k] = Math.cos(theta) * norm;
+        P_PHYS_matrix[1][k] = Math.sin(theta) * norm;
     }
 
+    // --- Internal space (all other Fourier modes) ---
+    const P_INT_matrix = []; // (N-2)xN
+
+    // --- ADD m=0 row (constant) required for odd N to ensure correct dimension ---
+    if (N % 2 !== 0 && N >= 3) { // Add for odd N >= 3
+        const row0 = new Array(N).fill(norm); // m=0 cos row
+        P_INT_matrix.push(row0);
+        console.log(" -> Added m=0 row for odd N.");
+    }
+
+    // --- Add m=2 up to floor(N/2) rows ---
+    for (let m = 2; m <= Math.floor(N / 2); m++) {
+        const rowC = new Array(N);
+        const rowS = new Array(N);
+        for (let k = 0; k < N; k++) {
+            const theta_m = 2 * Math.PI * m * k / N;
+            rowC[k] = Math.cos(theta_m) * norm;
+            rowS[k] = Math.sin(theta_m) * norm;
+        }
+        P_INT_matrix.push(rowC);
+        if (2 * m !== N) { // Skip sine row exactly at Nyquist for even N
+            P_INT_matrix.push(rowS);
+        }
+    }
+
+    if (P_INT_matrix.length !== internalDim && N >=3) { // N < 3 handled above
+        console.error(`Internal space dimension mismatch! Expected ${internalDim}, got ${P_INT_matrix.length} for N=${N}.`);
+        // This case should ideally not be reached if logic is correct.
+        // Fallback or error handling might be needed here.
+        // For now, log and continue, but projections might be incorrect.
+    }
+    
     config.P_PHYS = P_PHYS_matrix;
     config.P_INT = P_INT_matrix;
 
-    // Store basis vectors as ROWS for dot product projection functions
-    // config.parVecs = []; // Rows of P_PHYS^T - effectively the columns used above
-    // config.ortVecs = []; // Rows of P_INT^T
-    // for(let i=0; i<N; ++i) {
-    //     config.parVecs.push(Object.freeze([P_PHYS_matrix[0][i], P_PHYS_matrix[1][i]]));
-    //     config.ortVecs.push(Object.freeze([P_INT_matrix[0][i], P_INT_matrix[1][i], P_INT_matrix[2][i]]));
-    // }
-    // The projection functions need the ROWS of P_PHYS / P_INT, not columns.
-    // Let's redefine parVecs/ortVecs correctly.
-    config.parVecs = P_PHYS_matrix.map(row => Object.freeze([...row])); // 2 vectors of length 5
-    config.ortVecs = P_INT_matrix.map(row => Object.freeze([...row])); // 3 vectors of length 5
+    config.parVecs = P_PHYS_matrix.map(row => Object.freeze([...row]));
+    config.ortVecs = P_INT_matrix.map(row => Object.freeze([...row]));
 
-    console.log("Using fixed orthogonal de Bruijn projection basis.");
-    console.log("Phys Basis Vectors (Rows of P_PHYS):", config.parVecs);
-    console.log("Int Basis Vectors (Rows of P_INT):", config.ortVecs);
+    console.log(`Phys Basis Vectors (Rows of P_PHYS, ${config.parVecs.length}x${N}):`, config.parVecs);
+    console.log(`Int Basis Vectors (Rows of P_INT, ${config.ortVecs.length}x${N}):`, config.ortVecs);
 
-
-    // --- Calculate perturbed window center (remains the same logic) ---\
-    config.windowCenterInternalPerturbed = new THREE.Vector3(
-        (Math.random() - 0.5) * 2 * config.windowPerturbationMagnitude,
-        (Math.random() - 0.5) * 2 * config.windowPerturbationMagnitude,
-        (Math.random() - 0.5) * 2 * config.windowPerturbationMagnitude
-    );
-
-    // --- Define Window Planes: Use hardcoded 15 planes for Rhombic Triacontahedron ---
-    console.log("Using hardcoded 15 planes for canonical Penrose acceptance window...");
-    windowPlanes = [
-        { normal: new THREE.Vector3( 0.44721359549996,  0.00000000000000,  0.44721359549996), offset: 0.50000000000000 },
-        { normal: new THREE.Vector3(-0.36180339887499,  0.26286555605957,  0.44721359549996), offset: 0.50000000000000 },
-        { normal: new THREE.Vector3( 0.13819660112501, -0.42532540417602,  0.44721359549996), offset: 0.50000000000000 },
-        { normal: new THREE.Vector3( 0.13819660112501,  0.42532540417602,  0.44721359549996), offset: 0.50000000000000 },
-        { normal: new THREE.Vector3(-0.36180339887499, -0.26286555605957,  0.44721359549996), offset: 0.50000000000000 },
-
-        { normal: new THREE.Vector3(-0.11755705045849, -0.36180339887499,  0.11755705045849), offset: 0.24898982848828 },
-        { normal: new THREE.Vector3( 0.19021130325903, -0.13819660112501, -0.19021130325903), offset: 0.21266270208801 },
-        { normal: new THREE.Vector3(-0.19021130325903, -0.13819660112501,  0.19021130325903), offset: 0.21266270208801 },
-        { normal: new THREE.Vector3( 0.11755705045849, -0.36180339887499, -0.11755705045849), offset: 0.24898982848828 },
-        { normal: new THREE.Vector3( 0.30776835371753,  0.22360679774998,  0.11755705045849), offset: 0.24898982848828 },
-
-        { normal: new THREE.Vector3(-0.07265425280054,  0.22360679774998, -0.19021130325903), offset: 0.21266270208801 },
-        { normal: new THREE.Vector3( 0.23511410091699,  0.00000000000000,  0.19021130325903), offset: 0.21266270208801 },
-        { normal: new THREE.Vector3(-0.38042260651806,  0.00000000000000,  0.11755705045849), offset: 0.24898982848828 },
-        { normal: new THREE.Vector3(-0.07265425280054, -0.22360679774998, -0.19021130325903), offset: 0.21266270208801 },
-        { normal: new THREE.Vector3( 0.30776835371753, -0.22360679774998,  0.11755705045849), offset: 0.24898982848828 },
-    ];
-
-    if (windowPlanes.length !== 15) {
-        console.warn(`Expected 15 hardcoded planes, found ${windowPlanes.length}.`);
-    } else {
-        console.log(` -> Loaded ${windowPlanes.length} hardcoded planes for the acceptance window.`);
+    // --- Calculate perturbed window center for (N-2)D internal space ---
+    if (internalDim > 0) {
+        config.windowCenterInternalPerturbed = new Array(internalDim);
+        for (let i = 0; i < internalDim; i++) {
+            config.windowCenterInternalPerturbed[i] = (Math.random() - 0.5) * 2 * config.windowPerturbationMagnitude;
+        }
+    } else { // For N=2, internalDim is 0. Handle this edge case.
+        config.windowCenterInternalPerturbed = []; // No internal space, no perturbation.
     }
+    // Ensure windowShiftInternal also matches internalDim
+    // For now, we assume it's a THREE.Vector3 and only use x,y,z if internalDim >=3
+    // This will be properly handled when isInWindow is updated.
+    // If internalDim < 3, some components of windowShiftInternal might be unused or cause errors if not handled.
+    // For simplicity now, we'll let projectToInternal and isInWindow manage this.
+
+    // --- Window planes will be computed dynamically in Step 5 ---
+    // Clear any old hardcoded planes. The global `windowPlanes` will be repopulated later.
+    windowPlanes = []; 
+    console.log("Projection matrices and basis vectors updated for N=" + N + ".");
+    // console.log("Dynamic window planes will be computed in the next steps.");
 }
 
-
 /**
- * Projects a 5D vector onto the 2D physical subspace (E_phys).
- * @param {number[]} vec5D - The input 5D vector.
+ * Projects an N-D vector onto the 2D physical subspace (E_phys).
+ * @param {number[]} vecND - The input N-D vector.
  * @returns {THREE.Vector2} The resulting 2D vector in physical space.
  */
-function projectToPhysical(vec5D) {
-    // Dot product of vec5D with each ROW of P_PHYS
-    const x = dot(vec5D, config.parVecs[0]);
-    const y = dot(vec5D, config.parVecs[1]);
+function projectToPhysical(vecND) {
+    // Dot product of vecND with each ROW of P_PHYS
+    const x = dot(vecND, config.parVecs[0]);
+    const y = dot(vecND, config.parVecs[1]);
     return new THREE.Vector2(x, y);
 }
 
 /**
- * Projects a 5D vector onto the 3D internal subspace (E_int).
- * @param {number[]} vec5D - The input 5D vector.
- * @returns {THREE.Vector3} The resulting 3D vector in internal space.
+ * Projects an N-D vector onto the (N-2)-D internal subspace (E_int).
+ * @param {number[]} vecND - The input N-D vector.
+ * @returns {Float64Array} The resulting (N-2)-D vector in internal space.
  */
-function projectToInternal(vec5D) {
-    // Dot product of vec5D with each ROW of P_INT
-    const x = dot(vec5D, config.ortVecs[0]);
-    const y = dot(vec5D, config.ortVecs[1]);
-    const z = dot(vec5D, config.ortVecs[2]);
-    return new THREE.Vector3(x, y, z);
+function projectToInternal(vecND) {
+    const rows = config.P_INT;
+    const internalDim = rows.length;
+    const arr = new Float64Array(internalDim);
+    for (let r = 0; r < internalDim; r++) {
+        arr[r] = dot(vecND, rows[r]); // dot is the existing 5D helper, which is fine here.
+    }
+    return arr;
 }
 
 /**
- * Checks if the projection of a 5D point into internal space (vecInternal)
- * falls within the acceptance window (projected 5D hypercube).
- * Condition: |N_k ⋅ (p_int - p_shift)| <= d_k * scale for k=1..5
+ * Checks if the projection of an N-D point into internal space (vecInternal)
+ * falls within the acceptance window (projected N-D hypercube).
+ * Condition: |N_k ⋅ (p_int - p_shift)| <= d_k * scale for k=1..N
  * where N_k is the UNNORMALIZED projection Π_int(e_k) and d_k is its calculated offset.
- * @param {THREE.Vector3} vecInternal - The 3D point in internal space.
+ * @param {Float64Array} vecInternal - The (N-2)-D point in internal space.
  * @returns {boolean} True if the point is within the window, false otherwise.
  */
 function isInWindow(vecInternal) {
     if (windowPlanes.length === 0) {
+        // This might happen if N<3, where internalDim is 0 or 1, and windowPlanes might not be well-defined yet.
+        // Or if called before windowPlanes are computed in step 5.
+        // For N=2 (internalDim=0), all points could be considered "in window" or an error.
+        // For N=3 (internalDim=1), windowPlanes should have 3 planes.
+        if (config.nSym < 3 && vecInternal.length === 0) return true; // Tentative: if no internal space, all points in.
         console.warn("isInWindow called but windowPlanes is empty. Defaulting to false.");
         return false;
     }
 
-    // Adjust point by window center perturbation and UI shift
-    const effectiveVec = vecInternal.clone()
-        .sub(config.windowCenterInternalPerturbed)
-        .sub(config.windowShiftInternal);
+    const internalDim = vecInternal.length;
+    let effectiveVec = new Float64Array(internalDim); // To store intermediate results
 
-    // Check against the 5 plane conditions |N_k . x| <= d_k * scale
-    // Uses UNNORMALIZED normals (plane.normal) and their calculated offsets (plane.offset)
+    // Adjust point by window center perturbation
+    internalSubtract(vecInternal, config.windowCenterInternalPerturbed, effectiveVec);
+
+    // Adjust by UI shift (config.windowShiftInternal is now an array)
+    // Ensure shift array is compatible with internalDim
+    let currentShift = config.windowShiftInternal;
+    let tempShift = new Float64Array(internalDim);
+    for (let i = 0; i < internalDim; i++) {
+        tempShift[i] = (i < currentShift.length) ? currentShift[i] : 0; // Use value or 0 if array too short
+    }
+    
+    // Subtract the adapted shift from the current effectiveVec
+    let P_minus_S = new Float64Array(internalDim);
+    internalSubtract(effectiveVec, tempShift, P_minus_S);
+    effectiveVec = P_minus_S; // effectiveVec now holds (p_int - p_perturb - p_shift_ui)
+
+    // Check against the N plane conditions |N_k . x_effective| <= d_k * scale
+    // windowPlanes will contain {normal: Float64Array, offset: number}
     for (const plane of windowPlanes) {
         const scaledOffset = plane.offset * config.windowScale;
-        if (Math.abs(plane.normal.dot(effectiveVec)) > scaledOffset + config.epsilonComparison) {
+        // plane.normal is an array, effectiveVec is an array
+        if (Math.abs(internalDot(plane.normal, effectiveVec)) > scaledOffset + config.epsilonComparison) {
             return false; // Outside this pair of planes defined by N_k
         }
     }
@@ -405,43 +458,77 @@ function faceTiltDeg(u) {
 
 /**
  * Performs the main generation process:
- * 1. Iterates through points in a 5D integer lattice (Z^5).
- * 2. Projects each 5D point into 3D internal and 2D physical spaces.
+ * 1. Iterates through points in an N-D integer lattice (Z^N).
+ * 2. Projects each N-D point into (N-2)-D internal and 2D physical spaces.
  * 3. Accepts points if their internal projection is within the acceptance window.
- * 4. Stores accepted points with their 5D lattice coordinates and 2D physical coords.
- * 5. Generates edges and faces based on 5D connectivity.
+ * 4. Stores accepted points with their N-D lattice coordinates and 2D physical coords.
+ * 5. Generates edges and faces based on N-D connectivity.
  * 6. Creates/updates the Three.js objects for points, edges, and faces in the XY plane.
  */
 function performGeneration() {
-    console.log("Starting new generation cycle (5D -> 2D Penrose)...");
+    console.log(`Starting new generation cycle (${config.nSym}D -> 2D)...`);
     const startTime = performance.now();
 
-    // --- Clear previous generated data ---\
+    // --- Clear previous generated data ---
     acceptedPointsData = [];
     generatedEdges = [];
     generatedFaces = [];
+    // windowPlanes = []; // Clearing is already done in calculateProjectionMatrices, but good to be explicit if called independently.
+                       // However, per instructions, it's populated here now.
 
-    const N = config.dimension; // 5
+    const N = config.nSym;
+    const internalDim = N - 2;
+
+    // --- Dynamically compute acceptance window planes ---
+    windowPlanes = []; // Ensure it's clear before populating
+    if (N >= 3 && config.P_INT && config.P_INT.length === internalDim) {
+        console.log(`Computing ${N} window planes for ${internalDim}D internal space...`);
+        for (let k = 0; k < N; k++) {
+            // N_k is the kth column of P_INT, seen as a vector in internal space
+            const N_k_array = new Float64Array(internalDim);
+            for (let i = 0; i < internalDim; i++) {
+                if (config.P_INT[i] && k < config.P_INT[i].length) {
+                    N_k_array[i] = config.P_INT[i][k];
+                } else {
+                    // This case should ideally not happen if P_INT is correctly formed
+                    console.error(`Error accessing P_INT[${i}][${k}] for N_k construction. N=${N}, internalDim=${internalDim}`)
+                    N_k_array[i] = 0; // Default to 0 to avoid crashing, though results might be wrong
+                }
+            }
+            const offset = 0.5 * internalDot(N_k_array, N_k_array); // ||N_k||² / 2
+            windowPlanes.push({ normal: N_k_array, offset: offset });
+        }
+        console.log(` -> ${windowPlanes.length} window planes computed.`);
+    } else {
+        console.warn(`Skipping window plane computation. N=${N}, P_INT:`, config.P_INT);
+        // If N < 3 or P_INT is not set up, windowPlanes will remain empty.
+        // isInWindow has a check for empty windowPlanes.
+    }
+
     const maxCoord = Math.max(1, Math.round(config.extent));
     const minCoord = -maxCoord;
     let acceptedCount = 0;
     let processedCount = 0;
     let nextPointId = 0;
 
-    console.log(`Scanning 5D integer lattice Z^5 within extent: [${minCoord}, ${maxCoord}]`);
+    console.log(`Scanning ${config.nSym}D integer lattice Z^${config.nSym} within extent: [${minCoord}, ${maxCoord}]`);
 
     // Performance Tweak: Precompute max internal radius squared for sphere pre-check
     // Use a slightly generous bound based on the window planes offset
-    const maxInternalNormBound = windowPlanes.length > 0
-        ? windowPlanes.reduce((max, p) => Math.max(max, p.offset / Math.sqrt(p.normal.lengthSq())), 0) * config.windowScale * 1.5 // 1.5 safety factor
-        : (config.extent + 0.5) * 2; // Fallback if planes not ready
+    const maxInternalNormBound = windowPlanes.length > 0 && internalDim > 0
+        ? windowPlanes.reduce((max, p) => {
+            const normalLengthSq = internalLengthSq(p.normal);
+            if (normalLengthSq === 0) return max; // Avoid division by zero for zero-length normals
+            return Math.max(max, p.offset / Math.sqrt(normalLengthSq));
+          }, 0) * config.windowScale * 1.5 // 1.5 safety factor
+        : (config.extent + 0.5) * Math.sqrt(internalDim > 0 ? internalDim : 1); // Fallback if planes not ready or internalDim is 0
     const maxInternalRadiusSq = maxInternalNormBound * maxInternalNormBound;
     let preCheckSkipped = 0;
 
-    // --- Iterate through the 5D integer lattice ---\
+    // --- Iterate through the N-D integer lattice ---\
     // Recursive generator for iterating through N-dimensional hypercube
     function* latticePoints(currentDim, currentPoint) {
-        if (currentDim > N) { // Base case: yield the complete 5D point
+        if (currentDim > N) { // Base case: yield the complete N-D point
             processedCount++;
             yield currentPoint;
             return;
@@ -454,38 +541,47 @@ function performGeneration() {
     }
 
     // Start the iteration
-    for (const p5D of latticePoints(1, new Array(N))) {
+    for (const pND of latticePoints(1, new Array(N))) {
          // Optional: Add progress logging for very large extents
         // if (processedCount % 100000 === 0) {
         //    console.log(`... scanned ${processedCount} points`);
         // }
 
-        const pInternal = projectToInternal(p5D);
+        const pInternal = projectToInternal(pND);
 
         // Performance Tweak: Sphere pre-check
         // Skip if point's internal projection is definitely outside a bounding sphere around the window
-        if (pInternal.lengthSq() > maxInternalRadiusSq) {
+        if (internalLengthSq(pInternal) > maxInternalRadiusSq) {
             preCheckSkipped++;
             continue;
         }
 
         if (isInWindow(pInternal)) {
-            const pPhysical = projectToPhysical(p5D); // Project to 2D
+            const pPhysical = projectToPhysical(pND); // Project to 2D
 
             acceptedPointsData.push({
                 id: nextPointId++,
-                lattice: [...p5D], // Store a copy of the 5D lattice coordinates
+                lattice: [...pND], // Store a copy of the N-D lattice coordinates
                 phys: pPhysical, // Store the 2D physical coordinates
-                internal: pInternal // Store 3D internal coordinates (optional)
+                internal: pInternal // Store (N-2)D internal coordinates (optional)
             });
             acceptedCount++;
+
+            // --- NEW: Performance Guard ---
+            if (acceptedCount > MAX_ACCEPTED_VERTS) {
+                console.warn(`Vertex generation limit (${MAX_ACCEPTED_VERTS}) reached. Stopping lattice scan early.`);
+                break; // Exit the innermost loop (over pND)
+            }
+        }
+        // --- Check if the performance guard break needs to propagate upwards ---
+        if (acceptedCount > MAX_ACCEPTED_VERTS) {
+             break; // Exit the generator loop immediately
         }
     }
 
-
     const scanEndTime = performance.now();
     console.log(`Lattice scan complete in ${(scanEndTime - startTime).toFixed(2)} ms.`);
-    console.log(` -> Processed ${processedCount} total 5D lattice points (skipped ${preCheckSkipped} by pre-check).`);
+    console.log(` -> Processed ${processedCount} total ${config.nSym}D lattice points (skipped ${preCheckSkipped} by pre-check).`);
     console.log(` -> Accepted ${acceptedCount} points.`);
 
     if (acceptedPointsData.length > 0) {
@@ -567,11 +663,11 @@ function performGeneration() {
 }
 
 // =============================================================================
-// Connectivity Generation (Adapted for Penrose from Z^5)
+// Connectivity Generation (Adapted for Penrose from Z^N)
 // =============================================================================
 
 /**
- * Generates edges and faces (Penrose rhombi) based on the 5D lattice
+ * Generates edges and faces (generalized rhombi) based on the N-D lattice
  * connectivity of the accepted points.
  */
 function generateConnectivity() {
@@ -583,23 +679,23 @@ function generateConnectivity() {
     }
 
     const startTime = performance.now();
-    console.log("Generating connectivity (edges and faces) for Z^5 lattice...");
+    console.log("Generating connectivity (edges and faces) for Z^N lattice...");
 
-    // --- 1. Build LookupMap from 5D lattice coords to point data ---\
+    // --- 1. Build LookupMap from N-D lattice coords to point data ---\
     const lookupMap = new Map();
     acceptedPointsData.forEach(pt => {
         lookupMap.set(pt.lattice.join(','), pt);
     });
     console.log(` -> Built LookupMap with ${lookupMap.size} entries.`);
 
-    // --- 2. Generate Edges (Z^5 rule: neighbors differ by +/- e_i) ---\
+    // --- 2. Generate Edges (Z^N rule: neighbors differ by +/- e_i) ---\
     generatedEdges = [];
     let edgeCount = 0;
     const checkedEdges = new Set(); // Avoid duplicate checks (e.g., 1-2 vs 2-1)
-    const N = config.dimension; // 5
-    const standardBasis5D = [];
+    const N = config.nSym; // 5
+    const standardBasisND = [];
      for(let i=0; i<N; ++i) {
-         standardBasis5D.push(Object.freeze(Array(N).fill(0).map((_, idx) => idx === i ? 1 : 0)));
+         standardBasisND.push(Object.freeze(Array(N).fill(0).map((_, idx) => idx === i ? 1 : 0)));
      }
 
 
@@ -609,7 +705,7 @@ function generateConnectivity() {
         // Iterate through each dimension i
         for (let i = 0; i < N; i++) {
             // Check neighbor v0 + e_i
-            const neighborLatticePos = add(v0_lattice, standardBasis5D[i]);
+            const neighborLatticePos = vecAdd(v0_lattice, standardBasisND[i]); // Use renamed vecAdd
             const neighborKeyPos = neighborLatticePos.join(',');
             if (lookupMap.has(neighborKeyPos)) {
                 const neighborPt = lookupMap.get(neighborKeyPos);
@@ -623,16 +719,16 @@ function generateConnectivity() {
              // Check neighbor v0 - e_i (implicitly covered when iterating through neighborPt)
         }
     }
-    console.log(` -> Generated ${edgeCount} edges (Z^5 rule).`);
+    console.log(` -> Generated ${edgeCount} edges (Z^N rule).`);
 
-    // --- 3. Generate Faces (Penrose Rhombi from Z^5 parallelograms) ---\
+    // --- 3. Generate Faces (Generalized Rhombi from Z^N parallelograms) ---
     // A rhombus is formed by v0, v0+e_i, v0+e_j, v0+e_i+e_j if all are accepted points.
     generatedFaces = [];
     let faceCount = 0;
     const checkedFaces = new Set(); // Avoid duplicates
 
-    // Pre-calculate 2D projections of 5D basis vectors for angle check
-    const physProjections = standardBasis5D.map(e_i => projectToPhysical(e_i));
+    // Pre-calculate 2D projections of N-D basis vectors for angle check
+    const physProjections = standardBasisND.map(e_i => projectToPhysical(e_i));
 
     for (const pt of acceptedPointsData) {
         const v0_lattice = pt.lattice;
@@ -640,8 +736,8 @@ function generateConnectivity() {
 
         // Iterate through distinct pairs of dimensions (i, j)
         for (let i = 0; i < N; i++) {
-            const step_i = standardBasis5D[i];
-            const v1_lattice = add(v0_lattice, step_i);
+            const step_i = standardBasisND[i];
+            const v1_lattice = vecAdd(v0_lattice, step_i); // Use renamed vecAdd
             const key1 = v1_lattice.join(',');
 
             // Check if v0 + e_i is accepted
@@ -649,11 +745,11 @@ function generateConnectivity() {
             const p1 = lookupMap.get(key1); // Point data for v1
 
             for (let j = i + 1; j < N; j++) {
-                const step_j = standardBasis5D[j];
-                const v2_lattice = add(v0_lattice, step_j); // v0 + e_j
+                const step_j = standardBasisND[j];
+                const v2_lattice = vecAdd(v0_lattice, step_j); // Use renamed vecAdd
                 const key2 = v2_lattice.join(',');
 
-                const v3_lattice = add(v1_lattice, step_j); // v0 + e_i + e_j
+                const v3_lattice = vecAdd(v1_lattice, step_j); // Use renamed vecAdd
                 const key3 = v3_lattice.join(',');
 
                 // Check if v0+e_j and v0+e_i+e_j are also accepted points
@@ -681,22 +777,65 @@ function generateConnectivity() {
 
                         if (len1Sq > config.epsilonComparison && len2Sq > config.epsilonComparison) {
                             // Use integer index difference for classification
-                            const diff = (j - i + N) % N; // N=5. Ensures diff is 1, 2, 3, or 4
-                            if (diff === 1 || diff === 4) {
-                                type = 'thick'; // Adjacent basis vectors -> thick rhombus
-                            } else if (diff === 2 || diff === 3) {
-                                type = 'thin'; // Non-adjacent basis vectors -> thin rhombus
+                            const diff = (j - i + N) % N; // N=config.nSym. Ensures diff is 0 to N-1
+                                                          // For parallelograms from e_i, e_j with i < j, diff will be j-i or N-(j-i)
+                                                          // We are interested in the smaller angle, so usually j-i if j-i <= N/2
+                                                          // The problem defines d = (j - i + N) % N. Let's stick to this for now.
+                                                          // However, typically d=0 is not a valid parallelogram for distinct e_i, e_j.
+                                                          // And for tile types, we'd usually consider d and N-d as equivalent (same shape, diff orientation)
+                                                          // Let's use a canonical diff: min(j-i, N-(j-i)) for N distinct types for N-gons (up to N/2 types of rhombs)
+                           
+                            let canonicalDiff = (j - i); // since j > i, this is j-i
+                            // Smallest angle corresponds to smallest index difference, or N minus that difference.
+                            // Example N=5: j-i can be 1,2,3,4.
+                            // (0,1) -> diff=1. (0,2)->diff=2. (0,3)->diff=3 (same as N-2). (0,4)->diff=4 (same as N-1).
+                            // Types are usually based on min(diff, N-diff). For N=5, d=1 (thick), d=2 (thin).
+                            // For N=8: d=1, d=2, d=3. (d=4 is a square, distinct)
+                            // The instructions simply say: const type = `rhomb_d${diff}`; where diff = (j - i + N) % N
+                            // This will create types like rhomb_d1, rhomb_d2, ... up to rhomb_d(N-1) if i=0, j=N-1.
+                            // This might create more types than geometrically distinct rhombi for some N.
+                            // Let's follow the instruction first: d = (j - i + N) % N
+                            // Since j > i, j-i is always positive. So (j-i+N)%N is just j-i.
+                            // This means diff will range from 1 (e.g. i=0,j=1) to N-1 (e.g. i=0,j=N-1).
+                            // This will give N-1 types. This is likely too many.
+                            // The table given: N=5 -> 2 types (d=1, d=2). N=8 -> 3 types (d=1,2,3). N=12 -> 5 types (d=1..5)
+                            // This implies diff should be min( (j-i), N-(j-i) ), and should go up to floor((N-1)/2) if we exclude N/2 for even N (squares)
+                            // Or more simply, diff goes from 1 up to floor(N/2). Let's use this simpler interpretation: d = j-i. Max j-i is N-1. We need to map this. 
+
+                            // Let's use the definition d = (j-i). This will give values 1, 2, ..., N-1.
+                            // The prompt's table suggests fewer distinct types, up to floor(N/2).
+                            // Type 1: (j-i) = 1 or N-1
+                            // Type 2: (j-i) = 2 or N-2
+                            // ... up to Type floor(N/2)
+                            let actualDiff = j - i; //  1 <= actualDiff <= N-1 because i < j
+                            let typeIndex = Math.min(actualDiff, N - actualDiff); // This gives 1, 2, ..., floor(N/2)
+
+                            if (typeIndex > 0 && typeIndex <= Math.floor(N/2)) {
+                                type = `rhomb_d${typeIndex}`;
                             } else {
-                                console.warn("Unexpected index difference in face gen:", i, j, diff);
+                                // This case should not be hit if N >= 3 and i != j
+                                console.warn(`Unexpected typeIndex in face gen: i=${i}, j=${j}, N=${N}, actualDiff=${actualDiff}, typeIndex=${typeIndex}`);
                                 type = 'degenerate';
                             }
+
+                            // Original instruction from prompt: const type = `rhomb_d${diff}`; with diff = (j - i + N) % N
+                            // Let's re-evaluate. If N=5, i=0:
+                            // j=1: diff=(1-0+5)%5 = 1. type=rhomb_d1
+                            // j=2: diff=(2-0+5)%5 = 2. type=rhomb_d2
+                            // j=3: diff=(3-0+5)%5 = 3. type=rhomb_d3
+                            // j=4: diff=(4-0+5)%5 = 4. type=rhomb_d4
+                            // This generates N-1 types. The table shows for N=5, d=1 (thick), d=2 (thin). These correspond to typeIndex=1 and typeIndex=2.
+
+                            // So, the rule for type should be `rhomb_d${typeIndex}`
+                            // where typeIndex = min(j-i, N-(j-i))
+
                         } else {
                             // console.warn(`Zero length edge vector for face ${ids.join(',')}`);
                             type = 'degenerate';
                         }
 
                         // Only add non-degenerate faces
-                        if (type === 'thin' || type === 'thick') { // Exclude degenerate
+                        if (type !== 'degenerate' && type !== 'unknown') {
                             generatedFaces.push({ vertices: ids, type: type });
                             faceCount++;
                         }
@@ -807,117 +946,133 @@ function updateEdgesObject() {
     // console.log(" -> Edges object updated.");
 }
 
+// --- NEW: Color Generation for Rhomb Types ---
+function getRhombColor(typeIndex, maxTypeIndex) {
+    // typeIndex is 1, 2, ..., maxTypeIndex
+    // maxTypeIndex is typically Math.floor(config.nSym / 2)
+    const hue = (typeIndex -1) / Math.max(1, maxTypeIndex); // Normalized hue 0 to <1
+    return new THREE.Color().setHSL(hue, 0.7, 0.6); // Saturation 0.7, Lightness 0.6
+}
+
 /** Creates/updates the THREE.Mesh object for faces (rhombi) using geometry groups */
 function updateFacesObject() {
     disposeObject(facesObject);
     facesObject = null;
 
     if (!config.showFaces || generatedFaces.length === 0 || acceptedPointsData.length === 0) {
-        // console.log("Faces hidden or no data.");
         return;
     }
 
-    // console.log("Updating faces object...");
     const idToPointMap = new Map();
     acceptedPointsData.forEach(pt => idToPointMap.set(pt.id, pt));
 
-    const fullPositions = []; // Holds all unique vertex positions
-    const allIndices = [];    // Holds all triangle indices
-    const vertexMapFull = new Map(); // Map point ID to index in fullPositions array
+    const fullPositions = [];
+    const allIndices = [];
+    const vertexMapFull = new Map();
 
-    // Helper to add vertex data and return its index
     function addVertex(ptData) {
         if (!vertexMapFull.has(ptData.id)) {
             const index = vertexMapFull.size;
             vertexMapFull.set(ptData.id, index);
-            fullPositions.push(ptData.phys.x, ptData.phys.y, 0); // RESET to z=0
+            fullPositions.push(ptData.phys.x, ptData.phys.y, 0); // z=0 for flat faces
             return index;
         }
         return vertexMapFull.get(ptData.id);
     }
 
-    // Populate vertex and index arrays first
     generatedFaces.forEach(face => {
         const p0Data = idToPointMap.get(face.vertices[0]);
         const p1Data = idToPointMap.get(face.vertices[1]);
-        const p2Data = idToPointMap.get(face.vertices[2]); // v0+ei+ej
-        const p3Data = idToPointMap.get(face.vertices[3]); // v0+ej
+        const p2Data = idToPointMap.get(face.vertices[2]);
+        const p3Data = idToPointMap.get(face.vertices[3]);
 
         if (p0Data && p1Data && p2Data && p3Data) {
             const i0 = addVertex(p0Data);
             const i1 = addVertex(p1Data);
             const i2 = addVertex(p2Data);
             const i3 = addVertex(p3Data);
-
-            // Add two triangles for the rhombus: (P0, P1, P3) and (P0, P3, P2) -> indices (i0, i1, i2) and (i0, i2, i3)
-            allIndices.push(i0, i1, i2);
-            allIndices.push(i0, i2, i3);
+            allIndices.push(i0, i1, i2); // Triangle 1
+            allIndices.push(i0, i2, i3); // Triangle 2
         } else {
-            console.warn("Face references missing point ID:", face.vertices);
+            // console.warn("Face references missing point ID for flat faces:", face.vertices);
         }
     });
 
     if (vertexMapFull.size === 0 || allIndices.length === 0) {
-        // console.log(" -> No valid face vertices or indices found.");
         return;
     }
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(fullPositions, 3));
     geometry.setIndex(allIndices);
-
-    // Add groups for different materials based on face type
     geometry.clearGroups();
-    let currentFaceIndex = 0;
-    let thinCount = 0, thickCount = 0, unknownCount = 0;
+
+    const activeMaterialsList = [];
+    const materialTypeToIndexMap = new Map(); // Map type string to index in activeMaterialsList
+    let nextMaterialIndex = 0;
+    const maxRhombTypeIndex = Math.floor(config.nSym / 2);
+
+    let currentFaceTriangleStart = 0;
     generatedFaces.forEach(face => {
-         // Ensure the face vertices were valid (check if corresponding indices exist - though should be guaranteed if added to allIndices)
-         const i0 = vertexMapFull.get(face.vertices[0]);
-         if (i0 === undefined) return; // Skip if face had missing vertices
-
-        let materialIndex = -1;
-        if (face.type === 'thin') {
-            materialIndex = 0;
-            thinCount++;
-        } else if (face.type === 'thick') {
-            materialIndex = 1;
-            thickCount++;
-        } else { // 'unknown' or 'degenerate'
-            materialIndex = 2;
-            unknownCount++;
+        // Ensure face was valid (all vertices existed) before adding group
+        const p0Data = idToPointMap.get(face.vertices[0]);
+        if (!p0Data || !idToPointMap.get(face.vertices[1]) || !idToPointMap.get(face.vertices[2]) || !idToPointMap.get(face.vertices[3])) {
+            return; // Skip if any vertex was missing during index creation
         }
 
-        if (materialIndex !== -1) {
-            // Each face corresponds to 2 triangles (6 indices)
-            geometry.addGroup(currentFaceIndex * 6, 6, materialIndex);
-            currentFaceIndex++;
+        let materialType = face.type; // e.g., "rhomb_d1", "degenerate"
+
+        if (!faceMaterialsCache[materialType]) {
+            let color;
+            let standardProps = {
+                opacity: config.faceOpacity,
+                transparent: config.faceOpacity < 1.0,
+                side: THREE.DoubleSide,
+                metalness: 0.1,
+                roughness: 0.7,
+                polygonOffset: true,
+                polygonOffsetFactor: 1,
+                polygonOffsetUnits: 1
+            };
+
+            if (materialType.startsWith('rhomb_d')) {
+                const typeIndex = parseInt(materialType.substring('rhomb_d'.length));
+                color = getRhombColor(typeIndex, maxRhombTypeIndex);
+                faceMaterialsCache[materialType] = new THREE.MeshStandardMaterial({ ...standardProps, color: color });
+            } else { // Default to degenerate for any other type
+                materialType = degenerateMaterialTypeString; // Ensure consistent key
+                if (!faceMaterialsCache[materialType]) { // Check again with consistent key
+                    faceMaterialsCache[materialType] = new THREE.MeshStandardMaterial({
+                        ...standardProps,
+                        color: 0x808080, // Grey
+                        opacity: config.faceOpacity * 0.5, // More transparent
+                        transparent: (config.faceOpacity * 0.5) < 1.0,
+                    });
+                }
+            }
         }
+        
+        const material = faceMaterialsCache[materialType];
+        // Update opacity from GUI (already done if newly created, but good for existing)
+        material.opacity = (materialType === degenerateMaterialTypeString) ? config.faceOpacity * 0.5 : config.faceOpacity;
+        material.transparent = material.opacity < 1.0;
+
+        let matIndexInMesh = materialTypeToIndexMap.get(materialType);
+        if (matIndexInMesh === undefined) {
+            activeMaterialsList.push(material);
+            matIndexInMesh = nextMaterialIndex++;
+            materialTypeToIndexMap.set(materialType, matIndexInMesh);
+        }
+        
+        geometry.addGroup(currentFaceTriangleStart, 6, matIndexInMesh); // Each face is 2 triangles = 6 indices
+        currentFaceTriangleStart += 6;
     });
 
-
-    geometry.computeVertexNormals(); // Normals for lighting (all pointing up/down in XY plane)
-
-    const thinMaterial = new THREE.MeshStandardMaterial({
-        color: config.faceColor1,
-        opacity: config.faceOpacity,
-        transparent: config.faceOpacity < 1.0,
-        side: THREE.DoubleSide,
-        metalness: 0.1, roughness: 0.7, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 // Offset to avoid z-fighting with edges
-    });
-    const thickMaterial = new THREE.MeshStandardMaterial({
-         color: config.faceColor2,
-         opacity: config.faceOpacity,
-         transparent: config.faceOpacity < 1.0,
-         side: THREE.DoubleSide,
-         metalness: 0.1, roughness: 0.7, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
-     });
-   const unknownMaterial = new THREE.MeshStandardMaterial({ color: 0x808080, side: THREE.DoubleSide, opacity: 0.5, transparent: true }); // Grey for unknown/degenerate
-
-
-   facesObject = new THREE.Mesh(geometry, [thinMaterial, thickMaterial, unknownMaterial]);
-   scene.add(facesObject);
-
-   // console.log(` -> Faces object updated (${thinCount} thin, ${thickCount} thick, ${unknownCount} unknown/degenerate).`);
+    if (activeMaterialsList.length > 0) {
+        geometry.computeVertexNormals();
+        facesObject = new THREE.Mesh(geometry, activeMaterialsList);
+        scene.add(facesObject);
+    }
 }
 
 
@@ -968,11 +1123,11 @@ function heightProfile(u) {
 
 /**
  * Creates or updates the extruded dome mesh.
+ * REVISED VERSION with dynamic roof materials.
  */
 function updateDomeGeometry() {
     // Ensure r_max and base geometry is ready
     if (acceptedPointsData.length === 0 || generatedFaces.length === 0) {
-        // console.log("Cannot update dome: No base data.");
         disposeObject(domeMeshObject);
         disposeObject(domeEdgesObject);
         domeMeshObject = null;
@@ -984,61 +1139,35 @@ function updateDomeGeometry() {
     disposeObject(domeEdgesObject); // Also dispose edges
     domeMeshObject = null;
     domeEdgesObject = null;
-    domeMaterials = {}; // Clear material refs
+    // Keep domeMaterials = {} for now, will repopulate at the end
+    // But we use domeRoofMaterialsCache for creation/lookup
 
     if (!config.extrudeDome || acceptedPointsData.length === 0 || generatedFaces.length === 0) {
         console.log("Dome view disabled or no data.");
         return;
     }
 
-    // console.log("Updating dome geometry...");
-    console.log("Updating dome geometry...");
+    console.log("Updating dome geometry (dynamic roofs)...");
     const startTime = performance.now();
 
-    // --- 1. Prepare Vertex Data using vertexFinalZMap ---
-    const idToPointData = new Map(); // Keep: needed for new logic
-    acceptedPointsData.forEach(pt => idToPointData.set(pt.id, pt)); // Keep
+    // --- 1. Prepare Vertex Data ---
+    const idToPointData = new Map();
+    acceptedPointsData.forEach(pt => idToPointData.set(pt.id, pt));
 
-    const idToBaseIndex = new Map();   // Map ID to index in the base vertex array (0..N-1)
-    // const baseVertexCount = acceptedPointsData.length; // Will be redefined
-    // const positions = new Float32Array(baseVertexCount * 2 * 3); // Will be redefined
-
-    // acceptedPointsData.forEach((pt, index) => { // OLD LOOP TO BE DELETED
-    //     idToBaseIndex.set(pt.id, index);
-    //     const finalZ = vertexFinalZMap.get(pt.id) ?? 0; // Get pre-calculated Z
-    //
-    //     // Base vertex (z=0)
-    //     positions[index * 3 + 0] = pt.phys.x;
-    //     positions[index * 3 + 1] = pt.phys.y;
-    //     positions[index * 3 + 2] = 0;
-    //
-    //     // Top vertex (z=finalZ)
-    //     const topIndexOffset = baseVertexCount * 3;
-    //     positions[topIndexOffset + index * 3 + 0] = pt.phys.x;
-    //     positions[topIndexOffset + index * 3 + 1] = pt.phys.y;
-    //     positions[topIndexOffset + index * 3 + 2] = finalZ;
-    // });
-
-    // --- NEW: allocate separate top vertices for every rhombus -------------
+    const idToBaseIndex = new Map();
     const baseVertexCount = acceptedPointsData.length;
-    acceptedPointsData.forEach((pt, index) => { // Create idToBaseIndex here
-        idToBaseIndex.set(pt.id, index);
-    });
+    acceptedPointsData.forEach((pt, index) => { idToBaseIndex.set(pt.id, index); });
 
-    const topOffsetStart  = baseVertexCount;                // first free slot
-    let runningTopIndex   = 0;                              // per-rhombus
-
-    // map  faceIndex → [t0,t1,t2,t3]  (indices into *combined* position array)
+    const topOffsetStart = baseVertexCount;
+    let runningTopIndex = 0;
     const faceTopIndexMap = new Map();
+    const topPositions = []; // flat array of XYZ for top vertices
 
-    // We will push positions later after we know how many top vertices we need
-    const topPositions = [];   // flat array of XYZ
+    // Calculate top vertex positions for each face
     generatedFaces.forEach((face, fIdx) => {
         const ptIds = face.vertices;
-        // compute one height for the entire rhombus
-        _centroidHelper.set(0,0,0); // Reset centroid helper
+        _centroidHelper.set(0, 0, 0);
         let validPointsForCentroid = 0;
-
         ptIds.forEach(id => {
             const pData = idToPointData.get(id);
             if (pData) {
@@ -1049,197 +1178,198 @@ function updateDomeGeometry() {
         });
 
         if (validPointsForCentroid < 4) {
-            console.warn(`updateDomeGeometry: Face ${fIdx} has only ${validPointsForCentroid} valid points for centroid. Skipping tilt/face.`);
-            // Fill with flat, zero-height vertices to maintain array structure if necessary
-            // or handle by not adding this face to faceTopIndexMap and skipping in roof/wall gen.
-            // For now, let's assume it might lead to issues, so skip adding its top vertices.
-            // Make sure faceTopIndexMap reflects this skip if other parts rely on its entries.
-            // One simple way is to push degenerate vertices and let localTopIndices be created,
-            // but the face won't look right.
-            for (let i = 0; i < ptIds.length; i++) { // ptIds.length should be 4
-                 topPositions.push(0,0,0); // Push degenerate flat vertices
-            }
-            // Ensure faceTopIndexMap gets *something* if it's critical downstream, even if degenerate.
+            console.warn(`updateDomeGeometry: Face ${fIdx} (${face.type}) has only ${validPointsForCentroid} valid points. Skipping tilt/face.`);
             const localTopIndicesOnError = [];
-            for (let i = 0; i < ptIds.length; i++) {
-                localTopIndicesOnError.push(topOffsetStart + runningTopIndex++);
+            for (let i = 0; i < (ptIds.length || 4); i++) { // Assume 4 if ptIds missing?
+                 topPositions.push(0,0,0); // Push degenerate flat vertices
+                 localTopIndicesOnError.push(topOffsetStart + runningTopIndex++);
             }
             faceTopIndexMap.set(fIdx, localTopIndicesOnError);
             return; // Skip this face
         }
-        _centroidHelper.divideScalar(validPointsForCentroid); // Calculate average for centroid XY (z is 0)
+        _centroidHelper.divideScalar(validPointsForCentroid);
 
-        // --- NEW: base height coming from the radial profile ---
-        const u        = r_max > 0 ? _centroidHelper.length() / r_max : 0;
+        const u = r_max > 0 ? _centroidHelper.length() / r_max : 0;
         const zProfile = heightProfile(u);
-
-        // const tiltAngleRad = THREE.MathUtils.degToRad(config.tiltDeg); // OLD
-        const tiltAngleRad = THREE.MathUtils.degToRad(faceTiltDeg(u)); // NEW: use u-dependent tilt
-        const tiltQuat = getTiltQuaternion(_centroidHelper, tiltAngleRad, _tmpQuat); // Pass _tmpQuat as output
+        const tiltAngleRad = THREE.MathUtils.degToRad(faceTiltDeg(u));
+        const tiltQuat = getTiltQuaternion(_centroidHelper, tiltAngleRad, _tmpQuat);
 
         const localTopIndices = [];
         ptIds.forEach(id => {
             const pData = idToPointData.get(id);
-            _vertexPosHelper.set(
-                pData ? pData.phys.x : 0,
-                pData ? pData.phys.y : 0,
-                0
-            );
-
-            // 2.a  move to local frame, tilt, move back
-            _vertexPosHelper.sub(_centroidHelper)
-                            .applyQuaternion(tiltQuat)
-                            .add(_centroidHelper);
-
-            // 2.b  lift everything by the height profile
+            _vertexPosHelper.set(pData ? pData.phys.x : 0, pData ? pData.phys.y : 0, 0);
+            _vertexPosHelper.sub(_centroidHelper).applyQuaternion(tiltQuat).add(_centroidHelper);
             _vertexPosHelper.z += zProfile;
-
-            // 2.c  (optional) make sure roof never dips below the base plane
-            // _vertexPosHelper.z = Math.max(_vertexPosHelper.z, 0);
-
-            // --- NEW: Tighten vertical walls for cascading profile ---
             if (config.profileType === 'cascading') {
                 const k = Math.max(1, config.cascadeSteps);
                 const dz = (config.cascadeDrop * r_max) / k;
-                _vertexPosHelper.z -= dz * 0.5;    // sink roofs half a step
+                _vertexPosHelper.z -= dz * 0.5;
             }
-
-            topPositions.push(
-                _vertexPosHelper.x,
-                _vertexPosHelper.y,
-                _vertexPosHelper.z
-            );
+            topPositions.push(_vertexPosHelper.x, _vertexPosHelper.y, _vertexPosHelper.z);
             localTopIndices.push(topOffsetStart + runningTopIndex++);
         });
         faceTopIndexMap.set(fIdx, localTopIndices);
     });
 
     const totalVerts = baseVertexCount + runningTopIndex;
-    const positions  = new Float32Array(totalVerts * 3);
-
-    // copy base layer (unchanged)
-    acceptedPointsData.forEach((pt,i)=>{
-        positions[3*i]   = pt.phys.x;
-        positions[3*i+1] = pt.phys.y;
-        positions[3*i+2] = 0;
+    const positions = new Float32Array(totalVerts * 3);
+    // Copy base layer
+    acceptedPointsData.forEach((pt, i) => {
+        positions[3 * i] = pt.phys.x;
+        positions[3 * i + 1] = pt.phys.y;
+        positions[3 * i + 2] = 0;
     });
-    // copy top layer
-    for (let i=0;i<topPositions.length;i++) positions[baseVertexCount*3 + i] = topPositions[i];
+    // Copy top layer
+    positions.set(topPositions, baseVertexCount * 3);
 
-    // --- 2. Prepare Geometry Data ---
+    // --- 2. Prepare Geometry & Materials ---
     const indices = [];
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.clearGroups(); // Clear existing groups
+    geometry.clearGroups();
 
-    // --- 3. Generate Wall Faces (per edge) ---
-    const wallEdgeSeen = new Set();        // avoid double walls
-    generatedEdges.forEach(e=>{
+    const activeDomeMaterialsList = []; // Holds Wall, then Roof materials
+    const domeMaterialTypeToIndexMap = new Map(); // Maps type string to index in activeDomeMaterialsList
+    let nextDomeMaterialIndex = 0;
+
+    // --- Wall Material (Index 0) ---
+    const wallMaterialType = 'wall';
+    if (!domeRoofMaterialsCache[wallMaterialType]) { // Use roof cache for wall too, or a separate one?
+         domeRoofMaterialsCache[wallMaterialType] = new THREE.MeshStandardMaterial({
+             color: 0xFF8C00, // Orange
+             side: THREE.DoubleSide,
+             metalness: 0.1, roughness: 0.8,
+             opacity: config.faceOpacity, transparent: config.faceOpacity < 1.0,
+             polygonOffset: true, polygonOffsetFactor: 0.5, polygonOffsetUnits: 1
+         });
+    }
+    const wallMaterial = domeRoofMaterialsCache[wallMaterialType];
+    wallMaterial.opacity = config.faceOpacity;
+    wallMaterial.transparent = config.faceOpacity < 1.0;
+    
+    activeDomeMaterialsList.push(wallMaterial);
+    domeMaterialTypeToIndexMap.set(wallMaterialType, nextDomeMaterialIndex++);
+    const wallMaterialIndex = domeMaterialTypeToIndexMap.get(wallMaterialType);
+
+    // --- 3. Generate Wall Faces ---
+    const wallEdgeSeen = new Set();
+    generatedEdges.forEach(e => {
         const key = e.v1 < e.v2 ? `${e.v1}_${e.v2}` : `${e.v2}_${e.v1}`;
         if (wallEdgeSeen.has(key)) return;
         wallEdgeSeen.add(key);
-
         const b0 = idToBaseIndex.get(e.v1);
         const b1 = idToBaseIndex.get(e.v2);
+        if (b0 === undefined || b1 === undefined) return;
 
-        if (b0 === undefined || b1 === undefined) { // Check for undefined base indices
-            console.warn(`updateDomeGeometry wall gen: Skipping edge ${e.v1}-${e.v2} due to missing base index.`);
-            return;
-        }
-
-        // find which faces share this edge
         const facesSharing = generatedFaces
-            .map((f,idx)=> ({f,idx}))
-            .filter(obj=>{ const v=obj.f.vertices; return v.includes(e.v1)&&v.includes(e.v2); });
+            .map((f, idx) => ({ f, idx }))
+            .filter(obj => obj.f.vertices.includes(e.v1) && obj.f.vertices.includes(e.v2));
 
-        facesSharing.forEach(obj=>{
-            const idx  = obj.idx;
+        facesSharing.forEach(obj => {
+            const idx = obj.idx;
             const vArr = obj.f.vertices;
             const localTop = faceTopIndexMap.get(idx);
-
-            if (!localTop) { // Check if localTop exists
-                console.warn(`updateDomeGeometry wall gen: Missing faceTopIndexMap entry for face index ${idx}`);
-                return;
-            }
-
-            // localTop order matches vArr order → find positions of the two vertices
+            if (!localTop) return;
             const lf0 = vArr.indexOf(e.v1);
             const lf1 = vArr.indexOf(e.v2);
-
-            if (lf0 === -1 || lf1 === -1 || lf0 >= localTop.length || lf1 >= localTop.length) { // Bounds check
-                 console.warn(`updateDomeGeometry wall gen: Vertex index out of bounds for edge ${e.v1}-${e.v2} in face ${idx}. lf0: ${lf0}, lf1: ${lf1}, localTop.length: ${localTop.length}`);
-                 return;
-            }
-            const t0  = localTop[lf0];
-            const t1  = localTop[lf1];
-
-            indices.push(b0,b1,t1,  b0,t1,t0);
+            if (lf0 === -1 || lf1 === -1 || lf0 >= localTop.length || lf1 >= localTop.length) return;
+            const t0 = localTop[lf0];
+            const t1 = localTop[lf1];
+            indices.push(b0, b1, t1, b0, t1, t0); // Two triangles for wall quad
         });
     });
-
     const wallIndexCount = indices.length;
-    if (wallIndexCount > 0) { // Only add group if there are walls
-        geometry.addGroup(0, wallIndexCount, 0); // Material group 0: Walls
+    if (wallIndexCount > 0) {
+        geometry.addGroup(0, wallIndexCount, wallMaterialIndex); // Group 0 for walls
     }
 
-    // --- 4. Generate Roof Faces (per rhombus) ---
-    let roofStartIndex = indices.length; // Corrected: was wallIndexCount, should be current indices.length
-    generatedFaces.forEach((face,fIdx)=>{
-       const t = faceTopIndexMap.get(fIdx);   // [t0,t1,t2,t3] already in correct order
-       if (!t || t.length !== 4) { // Check if 't' is valid
-           console.warn(`updateDomeGeometry roof gen: Invalid or incomplete faceTopIndexMap for face index ${fIdx}. Skipping.`);
-           return;
-       }
-       indices.push(t[0],t[1],t[2],  t[0],t[2],t[3]);
+    // --- 4. Generate Roof Faces & Materials ---
+    const maxRhombTypeIndex = Math.floor(config.nSym / 2);
+    let roofStartIndex = wallIndexCount; // Start index for roof groups
 
-       const mat = (face.type==='thin')?1:(face.type==='thick')?2:3;
-       geometry.addGroup(roofStartIndex, 6, mat);
-       roofStartIndex += 6;
+    generatedFaces.forEach((face, fIdx) => {
+        const t = faceTopIndexMap.get(fIdx);
+        if (!t || t.length !== 4) {
+            return; // Skip if face vertices are not valid (e.g., from centroid warning)
+        }
+
+        let materialType = face.type;
+        let isDegenerate = false;
+
+        // Ensure type is valid, default to degenerate if not
+        if (!materialType || !materialType.startsWith('rhomb_d')) {
+            materialType = degenerateMaterialTypeString;
+            isDegenerate = true;
+        }
+
+        // Create material if not cached
+        if (!domeRoofMaterialsCache[materialType]) {
+            let color;
+            let standardProps = {
+                opacity: isDegenerate ? config.faceOpacity * 0.5 : config.faceOpacity,
+                transparent: (isDegenerate ? config.faceOpacity * 0.5 : config.faceOpacity) < 1.0,
+                side: THREE.DoubleSide,
+                metalness: 0.1,
+                roughness: 0.7
+            };
+            if (isDegenerate) {
+                domeRoofMaterialsCache[materialType] = new THREE.MeshStandardMaterial({ ...standardProps, color: 0x808080 });
+            } else {
+                const typeIndex = parseInt(materialType.substring('rhomb_d'.length));
+                color = getRhombColor(typeIndex, maxRhombTypeIndex);
+                domeRoofMaterialsCache[materialType] = new THREE.MeshStandardMaterial({ ...standardProps, color: color });
+            }
+        }
+
+        // Update opacity from GUI
+        const material = domeRoofMaterialsCache[materialType];
+        material.opacity = isDegenerate ? config.faceOpacity * 0.5 : config.faceOpacity;
+        material.transparent = material.opacity < 1.0;
+
+        // Get index in the final material list for the mesh
+        let matIndexInMesh = domeMaterialTypeToIndexMap.get(materialType);
+        if (matIndexInMesh === undefined) {
+            activeDomeMaterialsList.push(material); // Add to the list [wall, roof1, roof2, ...]
+            matIndexInMesh = nextDomeMaterialIndex++; // Assign the next available index
+            domeMaterialTypeToIndexMap.set(materialType, matIndexInMesh); // Store mapping type -> index
+        }
+
+        indices.push(t[0], t[1], t[2], t[0], t[2], t[3]); // Add roof quad indices
+        geometry.addGroup(roofStartIndex, 6, matIndexInMesh); // Use the mapped index for the group
+        roofStartIndex += 6;
     });
 
+    // --- 5. Finalize Geometry and Create Mesh ---
     geometry.setIndex(indices);
-    geometry.computeVertexNormals();
+    if (indices.length > 0) {
+        geometry.computeVertexNormals(); // Compute normals if there's geometry
+    }
 
-    // --- 5. Create Mesh with Multiple Materials ---
-    domeMaterials.wall = new THREE.MeshStandardMaterial({
-        color: 0xFF8C00, // Changed to orange for extruded walls
-        side: THREE.DoubleSide,
-        metalness: 0.1, roughness: 0.8,
-        opacity: config.faceOpacity, transparent: config.faceOpacity < 1.0,
-        polygonOffset: true, polygonOffsetFactor: 0.5, polygonOffsetUnits: 1 // Offset slightly more than faces // REDUCED polygonOffsetFactor
+    if (activeDomeMaterialsList.length > 0) {
+        domeMeshObject = new THREE.Mesh(geometry, activeDomeMaterialsList);
+        scene.add(domeMeshObject);
+    } else {
+        // console.log("No geometry or materials generated for dome mesh.");
+    }
+
+    // --- Update domeMaterials global object for GUI access ---
+    // Store references to the active materials by type name for GUI updates (opacity/visibility)
+    domeMaterials = {}; // Clear old references
+    domeMaterialTypeToIndexMap.forEach((index, type) => {
+        domeMaterials[type] = activeDomeMaterialsList[index];
     });
-     domeMaterials.thinRoof = new THREE.MeshStandardMaterial({
-         color: config.faceColor1,
-         opacity: config.faceOpacity, transparent: config.faceOpacity < 1.0,
-         side: THREE.DoubleSide,
-         metalness: 0.1, roughness: 0.7
-     });
-     domeMaterials.thickRoof = new THREE.MeshStandardMaterial({
-          color: config.faceColor2,
-          opacity: config.faceOpacity, transparent: config.faceOpacity < 1.0,
-          side: THREE.DoubleSide,
-          metalness: 0.1, roughness: 0.7
-      });
-     domeMaterials.unknownRoof = new THREE.MeshStandardMaterial({ color: 0x808080, side: THREE.DoubleSide, opacity: 0.5, transparent: true }); // Degenerate roof
-
-
-    domeMeshObject = new THREE.Mesh(geometry, [
-        domeMaterials.wall,
-        domeMaterials.thinRoof,
-        domeMaterials.thickRoof,
-        domeMaterials.unknownRoof
-    ]);
-    // Visibility handled by updateVisibility
-    // domeMeshObject.visible = config.extrudeDome;
-    scene.add(domeMeshObject);
 
     // --- 6. Create Dome Edges ---
-    const edgesGeom = new THREE.EdgesGeometry(geometry, 30); // Threshold angle to show sharp edges
-    const edgeMaterial = new THREE.LineBasicMaterial({ color: config.edgeColor });
-    domeEdgesObject = new THREE.LineSegments(edgesGeom, edgeMaterial);
-    // Visibility handled by updateVisibility
-    // domeEdgesObject.visible = config.extrudeDome && config.showEdges;
-    scene.add(domeEdgesObject);
+    if (domeMeshObject && domeMeshObject.geometry.attributes.position && domeMeshObject.geometry.attributes.position.count > 0) {
+        disposeObject(domeEdgesObject); // Dispose previous before creating new
+        const edgesGeom = new THREE.EdgesGeometry(domeMeshObject.geometry, 30); 
+        const edgeMaterial = new THREE.LineBasicMaterial({ color: config.edgeColor });
+        domeEdgesObject = new THREE.LineSegments(edgesGeom, edgeMaterial);
+        scene.add(domeEdgesObject);
+    } else {
+        disposeObject(domeEdgesObject);
+        domeEdgesObject = null;
+    }
 
     const endTime = performance.now();
     console.log(`Dome geometry updated in ${(endTime - startTime).toFixed(2)} ms.`);
@@ -1306,20 +1436,84 @@ function setupGUI() {
     guiControllers = {}; // Reset references when GUI is rebuilt
     gui.title("Penrose Tiling Controls");
 
-    // --- Generation Parameters Folder ---\
+    // Function to dispose existing material caches
+    const disposeMaterialCaches = () => {
+        const disposeMaterial = (mat) => { if (mat && mat.dispose) mat.dispose(); };
+        Object.values(faceMaterialsCache).forEach(disposeMaterial);
+        Object.values(domeRoofMaterialsCache).forEach(disposeMaterial);
+        faceMaterialsCache = {};
+        domeRoofMaterialsCache = {};
+        // domeMaterials global reference is rebuilt in updateDomeGeometry, just clear caches
+        console.log("Cleared and disposed material caches.");
+    };
+
+    // --- Generation Parameters Folder ---
     const genFolder = gui.addFolder('Generation Parameters');
-    genFolder.add(config, 'extent', 1, 7, 1).name('5D Search Extent').onChange(performGeneration); // Max 7 is already very slow
-    genFolder.add(config, 'windowScale', 0.1, 3.0, 0.05).name('Window Scale').onChange(performGeneration); // NEW control
+    guiControllers.nSym = genFolder.add(config, 'nSym', 3, 12, 1).name('n-fold Symmetry (N)').onChange(() => {
+        if (config.nSym > 7) { 
+            const estimatedComplexity = Math.pow(config.extent, config.nSym);
+            console.warn(`High nSym (${config.nSym}) with extent ${config.extent}. Est. complexity factor ~${estimatedComplexity.toExponential(2)}. May be slow!`);
+        }
+        // Clear material caches when N changes
+        disposeMaterialCaches(); 
 
-    // --- Internal Window Shift Sub-Folder (3D) ---\
-    const shiftFolder = genFolder.addFolder('Window Shift (Internal)');
-    const shiftRange = 1.0; // Adjust range based on window size (~0.5 offset)
-    shiftFolder.add(config.windowShiftInternal, 'x', -shiftRange, shiftRange, 0.01).name('Shift X').onChange(performGeneration).listen();
-    shiftFolder.add(config.windowShiftInternal, 'y', -shiftRange, shiftRange, 0.01).name('Shift Y').onChange(performGeneration).listen();
-    shiftFolder.add(config.windowShiftInternal, 'z', -shiftRange, shiftRange, 0.01).name('Shift Z').onChange(performGeneration).listen();
-    genFolder.open();
+        // Recalculate basis and update window shift array size
+        calculateProjectionMatrices(); 
+        const internalDim = config.nSym - 2;
+        // Ensure windowShiftInternal array has enough elements, padding with 0 if needed
+        while (config.windowShiftInternal.length < internalDim) {
+             config.windowShiftInternal.push(0);
+        }
+        // Note: We don't truncate the array if internalDim decreases, previous values remain.
+        
+        // Rebuild the shift GUI dynamically
+        rebuildShiftGUI(genFolder);
 
-    // --- Visualization Parameters Folder ---\
+        performGeneration();           
+    });
+    guiControllers.extent = genFolder.add(config, 'extent', 1, 7, 1).name('Lattice Extent (per dim)').onChange(performGeneration); 
+    guiControllers.windowScale = genFolder.add(config, 'windowScale', 0.1, 3.0, 0.05).name('Window Scale').onChange(performGeneration);
+
+    // --- Internal Window Shift Sub-Folder (Dynamically Built) ---
+    let shiftFolder = null; // Keep reference to folder
+    const shiftRange = 1.0; 
+
+    function rebuildShiftGUI(parentFolder) {
+        if (shiftFolder) {
+            shiftFolder.destroy(); // Remove old folder and its controllers
+        }
+        shiftFolder = parentFolder.addFolder(`Window Shift (${config.nSym - 2}D Internal)`);
+        const internalDim = config.nSym - 2;
+        // Adapt shift array size if needed (redundant if done in nSym onChange, but safe)
+         while (config.windowShiftInternal.length < internalDim) {
+             config.windowShiftInternal.push(0);
+         }
+
+        for (let i = 0; i < internalDim; i++) {
+            // Need to add controller for config.windowShiftInternal[i]
+            // lil-gui doesn't directly support adding controllers for array elements easily.
+            // Workaround: Add to a temporary proxy object, or rebuild GUI differently.
+            // Simpler for now: Just show the first 3 if dim >= 3, like before, until better GUI strategy.
+            // This avoids complex proxy objects or full GUI rebuild on N change.
+            if (i < 3) { // Limit to 3 sliders for simplicity for now
+                 const axis = ['X', 'Y', 'Z'][i];
+                 shiftFolder.add(config.windowShiftInternal, i, -shiftRange, shiftRange, 0.01)
+                     .name(`Shift ${axis}`)
+                     .onChange(performGeneration)
+                     .listen();
+            } else {
+                // Optionally add disabled display or hide for dims > 3?
+                // shiftFolder.add({value: config.windowShiftInternal[i]}, 'value').name(`Shift Axis ${i+1}`).disable();
+                 break; // Stop adding sliders after Z for now
+            }
+        }
+         if (internalDim > 0) shiftFolder.open();
+    }
+
+    rebuildShiftGUI(genFolder); // Initial build
+    // genFolder.open(); // Keep top-level folder open
+
+    // --- Visualization Parameters Folder ---
     const vizFolder = gui.addFolder('Visualization');
 
     // --- Points Controls ---\
@@ -1346,38 +1540,38 @@ function setupGUI() {
     // --- Faces Controls ---\
     const facesFolder = vizFolder.addFolder('Faces (Rhombi)');
     facesFolder.add(config, 'showFaces').name('Show Faces').onChange(updateVisibility);
-    facesFolder.addColor(config, 'faceColor1').name('Thin Color').onChange(() => {
-        if (facesObject && Array.isArray(facesObject.material) && facesObject.material[0]) facesObject.material[0].color.set(config.faceColor1);
-        if (domeMaterials.thinRoof) domeMaterials.thinRoof.color.set(config.faceColor1);
-    });
-     facesFolder.addColor(config, 'faceColor2').name('Thick Color').onChange(() => {
-         if (facesObject && Array.isArray(facesObject.material) && facesObject.material[1]) facesObject.material[1].color.set(config.faceColor2);
-         if (domeMaterials.thickRoof) domeMaterials.thickRoof.color.set(config.faceColor2);
-     });
     facesFolder.add(config, 'faceOpacity', 0, 1, 0.01).name('Opacity').onChange(() => {
-         if (facesObject && Array.isArray(facesObject.material)) {
-             facesObject.material.forEach(m => {
-                 m.opacity = config.faceOpacity;
-                 m.transparent = config.faceOpacity < 1.0; // Update transparency flag
-             });
-         }
-         // Also update dome ROOF opacity
          const isTransparent = config.faceOpacity < 1.0;
-         if (domeMaterials.thinRoof) {
-             domeMaterials.thinRoof.opacity = config.faceOpacity;
-             domeMaterials.thinRoof.transparent = isTransparent;
+         const degenerateOpacity = config.faceOpacity * 0.5;
+         const isDegenerateTransparent = degenerateOpacity < 1.0;
+
+         // Update flat face materials
+         for (const type in faceMaterialsCache) {
+             const material = faceMaterialsCache[type];
+             if (type === degenerateMaterialTypeString) {
+                 material.opacity = degenerateOpacity;
+                 material.transparent = isDegenerateTransparent;
+             } else {
+                 material.opacity = config.faceOpacity;
+                 material.transparent = isTransparent;
+             }
          }
-         if (domeMaterials.thickRoof) {
-             domeMaterials.thickRoof.opacity = config.faceOpacity;
-             domeMaterials.thickRoof.transparent = isTransparent;
+
+         // Update dome roof materials
+         for (const type in domeRoofMaterialsCache) {
+             const material = domeRoofMaterialsCache[type];
+             if (type === degenerateMaterialTypeString) {
+                 material.opacity = degenerateOpacity;
+                 material.transparent = isDegenerateTransparent;
+             } else {
+                 material.opacity = config.faceOpacity;
+                 material.transparent = isTransparent;
+             }
          }
-         if (domeMaterials.unknownRoof) { // Keep degenerate semi-transparent maybe?
-              domeMaterials.unknownRoof.opacity = config.faceOpacity * 0.7; // Slightly more transparent
-              domeMaterials.unknownRoof.transparent = isTransparent || domeMaterials.unknownRoof.opacity < 1.0;
-         }
-         // Update WALL opacity too?
+
+         // Update dome wall material opacity
          if (domeMaterials.wall) {
-              domeMaterials.wall.opacity = config.faceOpacity; // Link wall opacity
+              domeMaterials.wall.opacity = config.faceOpacity; 
               domeMaterials.wall.transparent = isTransparent;
          }
      });
