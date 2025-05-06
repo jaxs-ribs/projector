@@ -1,5 +1,59 @@
+/**
+ * Quasicrystal Dome Generator
+ *
+ * Overview:
+ * This script builds an interactive 3D hemispherical quasicrystal dome with full icosahedral symmetry
+ * using the "cut-and-project" method from a 6-dimensional (D6) integer lattice.
+ *
+ * Key Steps:
+ * 1. Basis Computation (calculateProjectionMatrices):
+ *    • Define three initial 6D vectors that span the "physical" subspace (E_phys).
+ *    • Orthonormalize them via Gram-Schmidt to get parVec1/2/3 (physical basis).
+ *    • Extend with the standard 6D basis, re-orthonormalize to extract the remaining
+ *      three vectors ortVec1/2/3 (internal or "perp" basis, E_int).
+ *    • Slightly perturb the internal window center to avoid degeneracies.
+ *    • Generate the 30 Rhombic-Triacontahedron (RT) window planes by projecting the 30
+ *      D6 root vectors (±e_i ± e_j) into E_int and computing supporting plane offsets.
+ *
+ * 2. Cut-and-Project Generation (performGeneration):
+ *    • Scan all integer points p ∈ Z⁶ in a configurable range (extent).
+ *    • Enforce D6 parity: sum(coords) % 2 === 0.
+ *    • Project into internal space: p_int = Π_int^T p. Keep only points inside the RT window.
+ *    • Project into physical space: p_phys = Π_phys^T p. Keep only points in the upper
+ *      hemisphere shell defined by innerRadiusPhysical ≤ ‖p_phys‖ ≤ outerRadiusPhysical.
+ *    • Store accepted points with unique IDs and 3D positions.
+ *
+ * 3. Connectivity (generateConnectivity):
+ *    • Edges: connect any two accepted points whose 6D coordinates differ by ±e_i ± e_j.
+ *    • Faces: form rhombi (pairs of independent D6 roots) and filter to those whose
+ *      centroid lies within a small tolerance of the outer physical radius.
+ *
+ * 4. Three.js Rendering:
+ *    • updatePointsObject(): render vertices as THREE.Points.
+ *    • updateEdgesObject(): render edges as THREE.LineSegments.
+ *    • updateFacesObject(): render rhombi as two-triangle THREE.Mesh (MeshStandardMaterial).
+ *    • updateShellVisualization(): render a semi-transparent hemisphere guide (inner/outer radii).
+ *    • init() + animate(): set up scene, camera, lights, controls, and start render loop.
+ *
+ * 5. Interactive Controls (lil-gui):
+ *    • Generation parameters: internal window shift, scan extent, inner/outer radii.
+ *    • Visualization parameters: toggle points/edges/faces, colors, sizes, opacities.
+ *    • All changes automatically trigger regeneration or object updates.
+ *
+ * Goals:
+ *  - Demonstrate the cut-and-project algorithm for icosahedral quasicrystals.
+ *  - Produce a visually compelling, interactive dome that users can explore and tweak.
+ *  - Provide a clear, self-documented codebase for further extension by LLMs or developers.
+ *
+ * Usage:
+ * Copy this comment block to the top of the file to give full context to future readers
+ * or AI agents. It explains the mathematical foundation, data flow, rendering pipeline,
+ * and user interface design in one place.
+ */
+
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { ConvexGeometry } from 'three/addons/geometries/ConvexGeometry.js';
 import GUI from 'lil-gui';
 
 // =============================================================================
@@ -17,28 +71,37 @@ const config = {
     windowCenterInternalPerturbed: null,        // For genericity
 
     // --- Generation Parameters (UI controllable) ---
-    radiusInternal: 1.5,        // Acceptance window radius in internal space
+    // radiusInternal: 1.5,        // REMOVED - RT window size is fixed
     innerRadiusPhysical: 5.0,   // Inner radius of the physical space shell
     outerRadiusPhysical: 6.0,   // Outer radius of the physical space shell
     extent: 5,                  // Range [-extent, extent] for 6D lattice search
-    windowShiftInternal: new THREE.Vector3(0, 0, 0), // UI shift for the acceptance window center
+    windowShiftInternal: new THREE.Vector3(0, 0, 0), // UI shift for the RT window center
 
     // --- Visualization Parameters (UI controllable) ---
     vertexColor: '#ffffff',     // Color of the generated points
     vertexSize: 0.054,          // Size of the generated points
     edgeColor: '#ff00ff',       // Color for edges
-    faceColor: '#ffff00',       // Color for faces
+    faceColor: '#00eeee',       // Color for faces (Cyan)
     faceOpacity: 0.5,           // Opacity for faces
     shellColor: '#00ffff',      // Color for the guide shell visualization
     shellOpacity: 0.15,         // Opacity for the guide shell visualization
     showPoints: true,           // Toggle visibility for points
-    showEdges: false,           // Toggle visibility for edges
-    showFaces: false,           // Toggle visibility for faces
+    showEdges: true,           // Toggle visibility for edges (Default: ON)
+    showFaces: true,           // Toggle visibility for faces (Default: ON)
 
     // --- Fixed Parameters ---
     windowPerturbationMagnitude: 1e-6, // Small random offset for window center to avoid degenerate cases
     domeCenter: new THREE.Vector3(0, 0, 0), // Center for physical shell check (currently origin)
     epsilonComparison: 1e-12,          // Small value for floating point comparisons
+    faceRelativeRadiusTolerance: 0.05, // Relative tolerance (percentage of outerRadius) for face centroid check (UI adjustable) - increased default
+
+    // --- Tolerances for Golden Rhombus Shape Checks ---
+    rhombEdgeRelTol: 0.15, // RELAXED: Relative tolerance for edge lengths (was 0.10)
+    rhombAngleTol: 0.06,  // RELAXED: Max allowed difference between angle cosine and theoretical values (was 0.02)
+
+    // --- NEW: Vertex-based outer shell filter ---
+    faceOuterVertexFracNeeded : 0.75, // three of the four is enough (was 1.0)
+    vertexOuterTol            : 0.12, // 12% radial slack (was 0.045)
 };
 
 // --- Global Three.js Variables ---
@@ -53,6 +116,7 @@ let gui;                      // lil-gui instance
 let acceptedPointsData = []; // Stores { id, lattice, phys } records
 let generatedEdges = [];    // Stores { v1: id1, v2: id2 }
 let generatedFaces = [];    // Stores { vertices: [id0, id1, id2, id3] }
+let windowPlanes = [];      // Stores { normal: Vec3, offset: number } for the RT window
 
 // --- Global Utility Variables ---
 // Keep track of how many times isInWindow was called for logging (debug)
@@ -122,15 +186,19 @@ function gramSchmidt(vectors) {
  */
 function calculateProjectionMatrices() {
     const tau = config.goldenRatio;
-    const invTau = 1 / tau;
+    // const invTau = 1 / tau; // No longer needed with this basis
 
     // --- 1. Define initial vectors that SPAN E_phys (normalized or not, doesn't matter for GS) ---
     // These vectors determine the *orientation* of the physical subspace.
-    // Using the same structure as before, but unnormalized for clarity.
+    // This set uses irrational coefficients to break residual mirror symmetries
+    // that caused the previous canonical basis to yield only 28 planes.
+    const rt2 = Math.SQRT2; // √2
+    const rt3 = Math.sqrt(3); // √3
+
     const initialParVecs = [
-        [1, 0, tau, invTau, 0, 0],
-        [0, 1, 0, tau, invTau, 0],
-        [0, 0, 1, 0, tau, invTau]
+        [ 1,     rt2,  tau,        0,   -rt3,  tau ],
+        [ tau,      0,  1,   -tau*rt2,      0,  rt3 ],
+        [ rt3,    tau,  0,        1,    -tau, -rt2 ]
     ];
 
     // --- 2. Orthonormalize the physical basis vectors ---
@@ -197,6 +265,123 @@ function calculateProjectionMatrices() {
         (Math.random() - 0.5) * 2 * config.windowPerturbationMagnitude,
         (Math.random() - 0.5) * 2 * config.windowPerturbationMagnitude
     );
+
+    // --- 6. Calculate Rhombic Triacontahedron (RT) Window Planes ---
+    console.log("Calculating RT window planes...");
+    const startTime = performance.now();
+    windowPlanes = []; // Clear previous planes
+
+    // 6a. Generate 6D hypercube corners (+/- 0.5)^6
+    const cubeCorners6D = [];
+    for (let i = 0; i < 64; i++) {
+        const corner = [];
+        for (let j = 0; j < 6; j++) {
+            corner.push(((i >> j) & 1) ? 0.5 : -0.5);
+        }
+        cubeCorners6D.push(corner);
+    }
+
+    // 6b. Project corners to 3D internal space
+    const internalCorners = cubeCorners6D.map(c => projectToInternal(c)); // Array of THREE.Vector3
+
+    // --- Direct D6 root projection method ---
+    windowPlanes = []; // Ensure it's clear before calculation
+    const planeKeySet = new Set(); // Use a string-key Set to collapse ±n duplicates
+    console.log(" -> Calculating RT window planes using direct D6 root projection...");
+
+    for (let i = 0; i < 5; i++) {
+        for (let j = i + 1; j < 6; j++) {
+            for (const si of [+1, -1]) {
+                for (const sj of [+1, -1]) {
+                    // Define the 6D root vector
+                    const root6 = [0, 0, 0, 0, 0, 0];
+                    root6[i] = si;
+                    root6[j] = sj;
+
+                    // Project the 6D root vector to internal space to get the normal direction
+                    const n = projectToInternal(root6);
+
+                    // --- DIAGNOSTIC START (root projections) ---
+                    if (n.lengthSq() < 1e-26) { // Lowered threshold from epsilonComparison*epsilonComparison (1e-24) to 1e-26
+                        console.warn(`ZERO-INT-PROJ root  ${root6.join(',')}`);
+                        continue; // Skip this root
+                    } else {
+                        // normalise but keep a *high-precision* string of the direction
+                        const u = n.clone().normalize();
+                        const dirKey = `${u.x.toFixed(12)},${u.y.toFixed(12)},${u.z.toFixed(12)}`;
+                        if (planeKeySet.has(dirKey)) {
+                            // This check is actually for the *normalized direction* key before canonicalization
+                            // console.warn(`DUP-NORMAL root ${root6.join(',')}  ->  ${dirKey}`);
+                            // Note: This specific log might fire even with 30 final planes if multiple roots
+                            // map to the same direction *before* canonicalization handles the +/- pairs.
+                            // It's more informative to check the planeKeySet size at the end.
+                        }
+                    }
+                    // ---  DIAGNOSTIC END  ---
+
+                    // Check if the projected normal is non-zero before normalizing (Redundant check now due to check above)
+                    // if (n.lengthSq() < config.epsilonComparison * config.epsilonComparison) {
+                    //     // console.warn(`Skipping zero projected normal for root: ${root6.join(',')}`);
+                    //     continue;
+                    // }
+                    n.normalize();
+
+                    // --- Canonicalized String-Key Deduplication (±n collapse) ---
+                    // 1) build the "negative" version
+                    const nNeg = new THREE.Vector3(-n.x, -n.y, -n.z);
+                    // 2) pick whichever triple is lexicographically larger: (x,y,z) vs (-x,-y,-z)
+                    let canon = new THREE.Vector3();
+                    // Use epsilon comparison for stability near zero during comparison
+                    const lx = n.x, ly = n.y, lz = n.z;
+                    const rx = nNeg.x, ry = nNeg.y, rz = nNeg.z;
+                    const eps = config.epsilonComparison; // Use existing small value
+
+                    if (lx - rx > eps ||
+                       (Math.abs(lx - rx) < eps && (ly - ry > eps ||
+                       (Math.abs(ly - ry) < eps && lz - rz > eps))))
+                    {
+                         canon.copy(n);
+                    } else {
+                         canon.copy(nNeg);
+                    }
+                    // 3) round to 12 decimal places for a stable string key (Increased precision from 8)
+                    const key = `${canon.x.toFixed(12)},${canon.y.toFixed(12)},${canon.z.toFixed(12)}`;
+                    // 4) skip duplicates
+                    if (planeKeySet.has(key)) continue;
+                    planeKeySet.add(key);
+                    console.debug(`KEEP NORMAL ${key}`); // Added debug log
+
+                    // use `canon` (not `n`) from here on
+                    const normal = canon; // Assign canonical vector to be used
+
+                    // Calculate the offset d = max(normal . corner) over all projected corners
+                    let d = -Infinity;
+                    for (const cornerVec of internalCorners) {
+                        // d = Math.max(d, n.dot(cornerVec)); // OLD: used original n
+                        d = Math.max(d, normal.dot(cornerVec)); // NEW: use canonical normal
+                    }
+                    // windowPlanes.push({ normal: n, offset: d }); // OLD: used original n
+                    windowPlanes.push({ normal, offset: d }); // NEW: use canonical normal
+                }
+            }
+        }
+    }
+    // --- End Direct D6 root projection method ---
+
+    console.info(`RT-window plane normals (unique):`, [...planeKeySet]); // Added info log
+
+    const endTime = performance.now();
+    console.log(` -> Calculated ${windowPlanes.length} RT window planes in ${(endTime - startTime).toFixed(2)} ms (using direct D6 root projection). Should be 30.`); // Updated log
+    if (windowPlanes.length !== 30 && windowPlanes.length !== 0) {
+        // This warning should ideally not trigger anymore with the direct method
+        console.warn(`Expected 30 planes for RT, but found ${windowPlanes.length}. Check projection basis or calculation.`);
+    }
+
+    // Log the maximum radius of the calculated RT window (useful for setting extent)
+    const maxInternalRadius = internalCorners.reduce(
+        (max, v) => Math.max(max, v.length()), 0
+    );
+     console.log(` -> Max internal radius of calculated RT window: ${maxInternalRadius.toFixed(4)}`);
 }
 
 /**
@@ -229,23 +414,33 @@ function projectToInternal(vec6D) {
 
 /**
  * Checks if the projection of a 6D point into internal space (vecInternal)
- * falls within the spherical acceptance window.
+ * falls within the rhombic triacontahedron (RT) acceptance window defined by windowPlanes.
  * @param {THREE.Vector3} vecInternal - The 3D point in internal space.
- * @returns {boolean} True if the point is within the window, false otherwise.
+ * @returns {boolean} True if the point is within the RT window, false otherwise.
  */
-function isInWindow(vecInternal) {
-    // Calculate the effective window center (base perturbed center + UI shift)
-    const effectiveCenter = config.windowCenterInternalPerturbed.clone().add(config.windowShiftInternal);
+function isInWindow_RT(vecInternal) {
+    // Check if planes were successfully generated
+    if (windowPlanes.length === 0) {
+        console.warn("isInWindow_RT called but windowPlanes is empty. Defaulting to false.");
+        return false;
+    }
 
-    // Debug Log: Print effective center for the first few calls (optional)
-    // if (isInWindowCallCount < MAX_ISINWINDOW_LOGS) {
-    //     console.log(`isInWindow Call ${isInWindowCallCount}: Effective Center = (${effectiveCenter.x.toFixed(3)}, ${effectiveCenter.y.toFixed(3)}, ${effectiveCenter.z.toFixed(3)})`);
-    //     isInWindowCallCount++;
-    // }
+    // Calculate the effective position relative to the shifted center
+    const effectiveVec = vecInternal.clone()
+        .sub(config.windowCenterInternalPerturbed) // Apply small random perturbation
+        .sub(config.windowShiftInternal);         // Apply UI shift
 
-    // Check if squared distance to effective center is within squared radius
-    const distanceSq = vecInternal.distanceToSquared(effectiveCenter);
-    return distanceSq <= config.radiusInternal * config.radiusInternal;
+    // Test against all 30 half-space inequalities defined by the RT faces
+    for (const plane of windowPlanes) {
+        // If the point is outside *any* plane (i.e., dot product > offset),
+        // then it's outside the convex hull (the RT window).
+        if (plane.normal.dot(effectiveVec) > plane.offset + config.epsilonComparison) {
+            return false; // Outside this plane, so outside the RT
+        }
+    }
+
+    // If the point is inside or on the boundary of all planes, it's inside the RT window.
+    return true;
 }
 
 /**
@@ -318,9 +513,16 @@ function performGeneration() {
                             const p6D = [i, j, k, l, m, n];
                             processedCount++;
 
+                            // --- D6 Lattice Check ---
+                            const sum = i + j + k + l + m + n;
+                            if (sum % 2 !== 0) {
+                                continue; // Skip points not in D6 (odd sum)
+                            }
+                            // -----------------------
+
                             const pInternal = projectToInternal(p6D);
 
-                            if (isInWindow(pInternal)) {
+                            if (isInWindow_RT(pInternal)) {
                                 const pPhysical = projectToPhysical(p6D);
 
                                 if (isInPhysicalShell(pPhysical)) {
@@ -370,6 +572,12 @@ function performGeneration() {
 
     const totalEndTime = performance.now();
     console.log(`Full generation cycle (including connectivity & rendering) finished in ${(totalEndTime - startTime).toFixed(2)} ms.`);
+
+    // High-level sanity log
+    console.info(
+      `Generation summary: verts=${acceptedPointsData.length}, ` +
+      `edges=${generatedEdges.length}, faces=${generatedFaces.length}`
+    );
 }
 
 // =============================================================================
@@ -389,7 +597,7 @@ function generateConnectivity() {
     }
 
     const startTime = performance.now();
-    console.log("Generating connectivity (edges and faces)...");
+    console.log("Generating connectivity (edges and faces) for D6 lattice...");
 
     // --- 1. Build LookupMap ---
     const lookupMap = new Map();
@@ -398,92 +606,217 @@ function generateConnectivity() {
     });
     console.log(` -> Built LookupMap with ${lookupMap.size} entries.`);
 
-    // --- 2. Generate Edges ---
-    generatedEdges = []; // Clear previous edges
+    // --- 2. Generate Edges (D6 rule: neighbors differ by +/- e_i +/- e_j) ---
+    generatedEdges = [];
     let edgeCount = 0;
-    const checkedEdges = new Set(); // To avoid duplicate checks A->B vs B->A
+    const checkedEdges = new Set(); // To avoid duplicate checks
 
     for (const pt of acceptedPointsData) {
-        for (let i = 0; i < 6; i++) { // Iterate through 6 basis vector directions
-            const neighborLattice = [...pt.lattice];
-            neighborLattice[i]++; // Check neighbor in positive direction
+        const v0_lattice = pt.lattice;
 
-            const neighborKey = neighborLattice.join(',');
+        // Iterate through all pairs of distinct axes (i, j) with i < j
+        for (let i = 0; i < 5; i++) {
+            for (let j = i + 1; j < 6; j++) {
+                // Iterate through the four sign combinations for the step +/- e_i +/- e_j
+                for (const [si, sj] of [[+1, +1], [+1, -1], [-1, +1], [-1, -1]]) {
+                    const neighborLattice = [...v0_lattice];
+                    neighborLattice[i] += si;
+                    neighborLattice[j] += sj;
+                    const neighborKey = neighborLattice.join(',');
 
-            // Check if neighbor exists in the accepted set
-            if (lookupMap.has(neighborKey)) {
-                const neighborPt = lookupMap.get(neighborKey);
+                    // Check if the neighbor exists in the accepted set
+                    if (lookupMap.has(neighborKey)) {
+                        const neighborPt = lookupMap.get(neighborKey);
 
-                // Avoid duplicates: use a canonical key (e.g., sorted IDs)
-                const edgeKey = [pt.id, neighborPt.id].sort().join('-');
-                if (!checkedEdges.has(edgeKey)) {
-                     checkedEdges.add(edgeKey);
+                        // Avoid duplicates: use a canonical key (sorted IDs)
+                        // Note: This ensures we only add the edge once (e.g., 1-2, not 2-1)
+                        const edgeKey = [pt.id, neighborPt.id].sort().join('-');
+                        if (!checkedEdges.has(edgeKey)) {
+                            checkedEdges.add(edgeKey);
 
-                     // Optional: Shell filter - both points must be in shell (already guaranteed by generation?)
-                     // This check is technically redundant if points were already filtered,
-                     // but kept for clarity matching the spec's option.
-                     if (isInPhysicalShell(pt.phys) && isInPhysicalShell(neighborPt.phys)) {
-                         generatedEdges.push({ v1: pt.id, v2: neighborPt.id });
-                         edgeCount++;
-                     }
-                }
-            }
-        }
-    }
-    console.log(` -> Generated ${edgeCount} edges.`);
-
-    // --- 3. Generate Faces (Rhombi) ---
-    generatedFaces = []; // Clear previous faces
-    let faceCount = 0;
-    const checkedFaces = new Set(); // To avoid duplicates
-
-    for (const pt of acceptedPointsData) {
-        const v00_lattice = pt.lattice;
-        const p00 = pt; // Use pt directly
-
-        for (let i = 0; i < 5; i++) {       // First basis direction index
-            for (let j = i + 1; j < 6; j++) { // Second basis direction index
-
-                // Calculate lattice coordinates of the other 3 corners
-                const v10_lattice = [...v00_lattice]; v10_lattice[i]++;
-                const v11_lattice = [...v10_lattice]; v11_lattice[j]++;
-                const v01_lattice = [...v00_lattice]; v01_lattice[j]++;
-
-                // Serialize keys
-                const key10 = v10_lattice.join(',');
-                const key11 = v11_lattice.join(',');
-                const key01 = v01_lattice.join(',');
-
-                // Check if all four corners were accepted points
-                if (lookupMap.has(key10) && lookupMap.has(key11) && lookupMap.has(key01)) {
-                    const p10 = lookupMap.get(key10);
-                    const p11 = lookupMap.get(key11);
-                    const p01 = lookupMap.get(key01);
-
-                    // Avoid duplicates: Use a canonical key based on sorted IDs
-                    const faceVertexIds = [p00.id, p10.id, p11.id, p01.id].sort();
-                    const faceKey = faceVertexIds.join('-');
-
-                    if (!checkedFaces.has(faceKey)) {
-                         checkedFaces.add(faceKey);
-
-                         // Optional: Shell filter face-wise (again, likely redundant but matches spec)
-                         if ([p00, p10, p11, p01].every(p => isInPhysicalShell(p.phys))) {
-                             // Store face with consistent vertex order (matches spec)
-                             generatedFaces.push({
-                                 vertices: [p00.id, p10.id, p11.id, p01.id]
-                             });
-                             faceCount++;
-                         }
+                            // Optional: Shell filter (likely redundant, but for completeness)
+                            // if (isInPhysicalShell(pt.phys) && isInPhysicalShell(neighborPt.phys)) {
+                                generatedEdges.push({ v1: pt.id, v2: neighborPt.id });
+                                edgeCount++;
+                            // }
+                        }
                     }
                 }
             }
         }
     }
-    console.log(` -> Generated ${faceCount} faces (rhombi).`);
+    console.log(` -> Generated ${edgeCount} edges (D6 rule).`);
+
+
+    // --- 3. Generate Faces (D6 rule: parallelograms spanned by pairs of root vectors) ---
+    generatedFaces = [];
+    let faceCount = 0;
+    const checkedFaces = new Set(); // To avoid duplicates
+    let rhombEdgeFailCount = 0;
+    let rhombAngleFailCount = 0;
+    const MAX_RHOMB_EDGE_LOGS = 5;
+    const MAX_RHOMB_ANGLE_LOGS = 5;
+
+    // 3a. Pre-calculate the 30 D6 root vectors (+/- e_i +/- e_j)
+    const roots = [];
+    for (let i = 0; i < 5; i++) {
+        for (let j = i + 1; j < 6; j++) {
+            for (const si of [+1, -1]) {
+                for (const sj of [+1, -1]) {
+                    const r = [0, 0, 0, 0, 0, 0];
+                    r[i] = si;
+                    r[j] = sj;
+                    roots.push(r);
+                }
+            }
+        }
+    }
+    // console.log(` -> Generated ${roots.length} D6 root vectors.`);
+
+    // 3b. Iterate through points and pairs of root vectors
+    for (const pt of acceptedPointsData) {
+        const v0_lattice = pt.lattice;
+
+        // Iterate through all distinct pairs of root vectors (r, s)
+        for (let a = 0; a < roots.length; a++) {
+            const r = roots[a];
+            const v1_lattice = v0_lattice.map((x, idx) => x + r[idx]); // v0 + r
+            const key1 = v1_lattice.join(',');
+
+            // Check if v0 + r is an accepted point
+            if (!lookupMap.has(key1)) continue;
+            const p1 = lookupMap.get(key1);
+
+            for (let b = a + 1; b < roots.length; b++) { // Use b = a + 1 to avoid pairs (r,r) and duplicates (r,s), (s,r)
+                const s = roots[b];
+
+                // Check for collinearity: r and s are collinear if r = +/- s.
+                // This happens if their dot product is +/- (sqrt(2)*sqrt(2)) = +/- 2.
+                // Or, check element-wise: r[k] == s[k] for all k OR r[k] == -s[k] for all k.
+                let dotRS = 0;
+                for(let k=0; k<6; k++) dotRS += r[k]*s[k];
+                if (Math.abs(dotRS) === 2) {
+                     // console.log("Skipping collinear roots:", r, s);
+                     continue; // Skip collinear root pairs
+                }
+
+
+                const v2_lattice = v0_lattice.map((x, idx) => x + s[idx]); // v0 + s
+                const key2 = v2_lattice.join(',');
+
+                const v3_lattice = v1_lattice.map((x, idx) => x + s[idx]); // v0 + r + s
+                const key3 = v3_lattice.join(',');
+
+                // Check if v0+s and v0+r+s are also accepted points
+                if (lookupMap.has(key2) && lookupMap.has(key3)) {
+                    const p2 = lookupMap.get(key2);
+                    const p3 = lookupMap.get(key3);
+
+                    // Found a valid parallelogram in 6D.
+                    const ids = [pt.id, p1.id, p3.id, p2.id]; // Order: v0, v0+r, v0+r+s, v0+s
+
+                    // Deduplicate using a canonical key (sorted IDs)
+                    const faceKey = ids.slice().sort((a, b) => a - b).join('-');
+                    if (!checkedFaces.has(faceKey)) {
+                        
+                        // --- NEW: Vertex-based Outer Shell Filter ---
+                        const P0 = pt.phys;
+                        const P1 = p1.phys; // Corresponds to v0 + r
+                        const P2 = p3.phys; // Corresponds to v0 + r + s
+                        const P3 = p2.phys; // Corresponds to v0 + s
+
+                        const Router = config.outerRadiusPhysical;
+                        const vTolAbs = config.vertexOuterTol * Router;
+
+                        let outerHits = 0;
+                        [ P0, P1, P2, P3 ].forEach(p => {
+                            if (Math.abs(p.length() - Router) < vTolAbs) outerHits++;
+                        });
+
+                        if (outerHits / 4 < config.faceOuterVertexFracNeeded) continue; // Reject early if not enough vertices are near the outer shell
+
+                        // --- Absolute Band Guard ---
+                        const minR = Math.min(P0.length(), P1.length(), P2.length(), P3.length());
+                        const maxR = Math.max(P0.length(), P1.length(), P2.length(), P3.length());
+                        if (maxR - minR > vTolAbs) continue; // Reject face if it spans more than the allowed radial thickness band
+                        // --------------------------
+
+                        // --- Golden Rhombus Shape Check ---
+                         const edge1 = new THREE.Vector3().subVectors(P1, P0); // Edge along r
+                         const edge2 = new THREE.Vector3().subVectors(P3, P0); // Edge along s (Adjacent to edge1 at P0)
+
+                         const len1 = edge1.length();
+                         const len2 = edge2.length();
+
+                         // Reject if either edge collapses in physical space
+                         if (len1 < 1e-6 || len2 < 1e-6) continue; // Filter degenerate edges
+
+                         // Check 1: Are adjacent edge lengths approximately equal (relative tolerance)?
+                         if (Math.abs(len1 - len2) <= config.rhombEdgeRelTol * Math.min(len1, len2)) {
+                             // Check 2: Is the angle between edges correct?
+                             const cosAngle = edge1.dot(edge2) / (len1 * len2);
+                             const cos36 = Math.cos(Math.PI / 5); // ~0.8090
+                             const cos72 = Math.cos(2 * Math.PI / 5); // ~0.3090
+
+                             // We check absolute value of cosAngle because dot product might give cos(180-theta) = -cos(theta)
+                             const absCosAngle = Math.abs(cosAngle);
+
+                             if (Math.abs(absCosAngle - cos36) <= config.rhombAngleTol ||
+                                 Math.abs(absCosAngle - cos72) <= config.rhombAngleTol)
+                             {
+                                 // Passed both checks! Add the face.
+                                 checkedFaces.add(faceKey);
+                                 generatedFaces.push({ vertices: ids }); // Store with specific winding order
+                                 faceCount++;
+                             } else {
+                                 // Failed angle check
+                                 // console.log(`Rhombus check failed (angle): cos=${absCosAngle.toFixed(4)}, expected ~${cos36.toFixed(4)} or ~${cos72.toFixed(4)}`);
+                                 if (rhombAngleFailCount < MAX_RHOMB_ANGLE_LOGS) {
+                                     console.log(`AngFail |cos|=${absCosAngle.toFixed(5)}  ids=${ids}`); // Higher precision log
+                                     rhombAngleFailCount++;
+                                 } else if (rhombAngleFailCount === MAX_RHOMB_ANGLE_LOGS) {
+                                     console.log("(Further angle check failures omitted)");
+                                     rhombAngleFailCount++; // Increment once more to prevent re-logging the omission message
+                                 }
+                             }
+                         } else {
+                             // Failed edge length check
+                             // console.log(`Rhombus check failed (edge lengths): l1=${len1.toFixed(4)}, l2=${len2.toFixed(4)}, diff=${Math.abs(len1-len2).toFixed(4)}`);
+                             if (rhombEdgeFailCount < MAX_RHOMB_EDGE_LOGS) { 
+                                 console.log(`LenFail Δ=${Math.abs(len1-len2).toExponential(3)}  ids=${ids}`); // Higher precision log
+                                 rhombEdgeFailCount++;
+                             } else if (rhombEdgeFailCount === MAX_RHOMB_EDGE_LOGS) {
+                                 console.log("(Further edge length check failures omitted)");
+                                 rhombEdgeFailCount++; // Increment once more
+                             }
+                         }
+                         // --- End Golden Rhombus Shape Check ---
+                    }
+                }
+            }
+        }
+    }
+    console.log(` -> Generated ${faceCount} faces (D6 rule, filtered for outer shell).`);
+    // Log summary of rhombus check failures
+    if (rhombEdgeFailCount > MAX_RHOMB_EDGE_LOGS || rhombAngleFailCount > MAX_RHOMB_ANGLE_LOGS) {
+         console.log(` -> Rhombus checks: ${rhombEdgeFailCount - (rhombEdgeFailCount > MAX_RHOMB_EDGE_LOGS ? 1:0)} edge fails, ${rhombAngleFailCount - (rhombAngleFailCount > MAX_RHOMB_ANGLE_LOGS ? 1:0)} angle fails (logged max ${MAX_RHOMB_EDGE_LOGS}/${MAX_RHOMB_ANGLE_LOGS}).`);
+    } else if (rhombEdgeFailCount > 0 || rhombAngleFailCount > 0) {
+         console.log(` -> Rhombus checks: ${rhombEdgeFailCount} edge fails, ${rhombAngleFailCount} angle fails.`);
+    }
+
+    // Added debug log for filter stats
+    console.debug(
+      `Face filter stats: kept=${faceCount}, ` +
+      `edgeLenFails=${rhombEdgeFailCount}, angFails=${rhombAngleFailCount}`
+    );
 
     const endTime = performance.now();
-    console.log(`Connectivity generation finished in ${(endTime - startTime).toFixed(2)} ms.`);
+    console.log(`D6 Connectivity generation finished in ${(endTime - startTime).toFixed(2)} ms.`);
+
+    // Sanity check for face duplicates (only runs in dev builds)
+    console.assert(checkedFaces.size === generatedFaces.length,
+        'Duplicate-face mismatch (keys vs. array):',
+        checkedFaces.size, generatedFaces.length);
 }
 
 
@@ -760,16 +1093,18 @@ function setupGUI() {
 
     // --- Generation Parameters Folder ---
     const genFolder = gui.addFolder('Generation Parameters');
-    genFolder.add(config, 'radiusInternal', 0.1, 5.0, 0.05).name('Window Radius (Internal)').onChange(performGeneration);
+    // genFolder.add(config, 'radiusInternal', 0.1, 5.0, 0.05).name('Window Radius (Internal)').onChange(performGeneration); // REMOVED - RT window size is fixed
     genFolder.add(config, 'innerRadiusPhysical', 0.0, 20.0, 0.05).name('Inner Radius (Physical)').onChange(performGeneration).listen(); // listen() if modified elsewhere
     genFolder.add(config, 'outerRadiusPhysical', 0.1, 20.0, 0.05).name('Outer Radius (Physical)').onChange(performGeneration).listen();
     genFolder.add(config, 'extent', 1, 10, 1).name('6D Search Extent').onChange(performGeneration); // Increased max extent
 
-    // --- Internal Window Shift Sub-Folder ---
-    const shiftFolder = genFolder.addFolder('Window Shift (Internal)'); // Open by default now
-    shiftFolder.add(config.windowShiftInternal, 'x', -config.radiusInternal*2, config.radiusInternal*2, 0.01).name('Shift X').onChange(performGeneration).listen(); // Range relative to radius
-    shiftFolder.add(config.windowShiftInternal, 'y', -config.radiusInternal*2, config.radiusInternal*2, 0.01).name('Shift Y').onChange(performGeneration).listen();
-    shiftFolder.add(config.windowShiftInternal, 'z', -config.radiusInternal*2, config.radiusInternal*2, 0.01).name('Shift Z').onChange(performGeneration).listen();
+    // --- Internal Window Shift Sub-Folder --- Adjust range for fixed RT window
+    const shiftFolder = genFolder.addFolder('Window Shift (Internal RT)'); // Renamed slightly
+    const shiftRange = 0.5; // Adjusted range based on typical RT radius (~0.86)
+    shiftFolder.add(config.windowShiftInternal, 'x', -shiftRange, shiftRange, 0.01).name('Shift X').onChange(performGeneration).listen();
+    shiftFolder.add(config.windowShiftInternal, 'y', -shiftRange, shiftRange, 0.01).name('Shift Y').onChange(performGeneration).listen();
+    shiftFolder.add(config.windowShiftInternal, 'z', -shiftRange, shiftRange, 0.01).name('Shift Z').onChange(performGeneration).listen();
+    genFolder.open(); // Keep generation params open
 
     // --- Visualization Parameters Folder ---
     const vizFolder = gui.addFolder('Visualization');
@@ -794,7 +1129,7 @@ function setupGUI() {
          if (edgesObject) edgesObject.material.color.set(config.edgeColor);
          // updateEdgesObject(); // Alternatively, recreate if needed
     });
-    // edgesFolder.open(); // Closed by default
+    edgesFolder.open(); // Closed by default -> Open by default
 
     // --- Faces Controls ---
     const facesFolder = vizFolder.addFolder('Faces (Rhombi)');
@@ -807,7 +1142,10 @@ function setupGUI() {
          if (facesObject) facesObject.material.opacity = config.faceOpacity;
          // updateFacesObject(); // Alternatively, recreate if needed
     });
-    // facesFolder.open(); // Closed by default
+    facesFolder.add(config, 'faceRelativeRadiusTolerance', 0, 0.2, 0.01)
+               .name('Centroid Tolerance (Rel)')
+               .onChange(performGeneration); // Regenerate on change
+    facesFolder.open(); // Closed by default -> Open by default
 
     // --- Guide Shell Controls ---
     const shellFolder = vizFolder.addFolder('Guide Shell');
@@ -916,3 +1254,8 @@ function render() {
 
 init();     // Initialize everything
 animate();  // Start the rendering loop
+
+/*
+https://chatgpt.com/c/68176496-ceb4-8001-a5df-73573de79b65
+
+*/
