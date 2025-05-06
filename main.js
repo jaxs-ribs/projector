@@ -93,12 +93,16 @@ const config = {
     // --- Extrusion Parameters (UI controllable) ---
     extrudeDome: false,         // Toggle extrusion view
     domeRadius: 6.0,           // Target dome radius (TEMPORARY default, calculated later)
-    profileType: 'spherical',   // 'spherical', 'eased', 'stepped'
+    profileType: 'cascading',   // 'spherical', 'eased', 'stepped', 'cascading'
     tierCount: 5,               // For 'stepped' profile
     stepHeight: 1.0,           // For 'stepped' profile (TEMPORARY default, calculated later)
     _stepHeightUserSet: false, // Internal flag to track if user changed stepHeight
     tiltDeg: 0.0, // NEW: For cone-tilt of rhombi roofs
     // wallThickness: 0,        // Future: for solid cells
+    cascadeSteps: 12,          // NEW: number of tiers for cascading
+    cascadeDrop: 0.6,          // NEW: total height (× r_max) to distribute for cascading
+    tiltInnerDeg: 55,          // NEW: tilt at the very centre for cascading
+    tiltOuterDeg: 10,          // NEW: tilt at the rim for cascading
 
     // --- Visualization Parameters (UI controllable) ---
     vertexColor: '#ffffff',     // Color of the generated points
@@ -377,6 +381,21 @@ function getTiltQuaternion(centroidXY, tiltAngleRad, outQuaternion) {
 
     outQuaternion.setFromAxisAngle(rotationAxis, tiltAngleRad);
     return outQuaternion;
+}
+
+/**
+ * Calculates the tilt angle in degrees for a face based on its normalized radial distance (u).
+ * If the profile type is not 'cascading', it returns the general tiltDeg.
+ * @param {number} u - Normalized radial distance (r / r_max), range [0, 1].
+ * @returns {number} The calculated tilt angle in degrees.
+ */
+function faceTiltDeg(u) {
+    if (config.profileType !== 'cascading') return config.tiltDeg;
+    const t0 = config.tiltInnerDeg;
+    const t1 = config.tiltOuterDeg;
+    // Ensure u is clamped between 0 and 1 for the interpolation
+    const clampedU = Math.max(0, Math.min(1, u));
+    return t1 + (t0 - t1) * (1 - clampedU);   // larger tilt near centre (u=0)
 }
 
 
@@ -913,7 +932,7 @@ function updateFacesObject() {
  */
 function heightProfile(u) {
     const R = config.domeRadius;
-    if (u * r_max > R) return 0; // Clamp height if point is beyond dome radius footprint
+    if (u * r_max > R && config.profileType !== 'cascading') return 0; // Clamp height if point is beyond dome radius footprint, except for cascading
     // Ensure u is within [0,1] for profile functions to avoid issues like sqrt(negative)
     u = Math.max(0, Math.min(1, u));
 
@@ -933,6 +952,14 @@ function heightProfile(u) {
             const tier = Math.floor(effectiveTierCount * u);
             // Ensure z doesn't exceed R for the highest tier
             return Math.min(R, effectiveStepHeight * tier);
+        case 'cascading': {
+            const k = Math.max(1, config.cascadeSteps); // Ensure k is at least 1
+            const stepId = Math.floor(u * k);           // 0 … k-1
+            // If u is 1.0, stepId can be k. Clamp it to k-1 for the highest step.
+            const clampedStepId = Math.min(stepId, k - 1);
+            const dz = (config.cascadeDrop * r_max) / k; // total height is cascadeDrop * r_max
+            return dz * clampedStepId;
+        }
         default:
             console.warn("Unknown profile type:", config.profileType);
             return 0; // Default to flat
@@ -1046,7 +1073,8 @@ function updateDomeGeometry() {
         const u        = r_max > 0 ? _centroidHelper.length() / r_max : 0;
         const zProfile = heightProfile(u);
 
-        const tiltAngleRad = THREE.MathUtils.degToRad(config.tiltDeg);
+        // const tiltAngleRad = THREE.MathUtils.degToRad(config.tiltDeg); // OLD
+        const tiltAngleRad = THREE.MathUtils.degToRad(faceTiltDeg(u)); // NEW: use u-dependent tilt
         const tiltQuat = getTiltQuaternion(_centroidHelper, tiltAngleRad, _tmpQuat); // Pass _tmpQuat as output
 
         const localTopIndices = [];
@@ -1068,6 +1096,13 @@ function updateDomeGeometry() {
 
             // 2.c  (optional) make sure roof never dips below the base plane
             // _vertexPosHelper.z = Math.max(_vertexPosHelper.z, 0);
+
+            // --- NEW: Tighten vertical walls for cascading profile ---
+            if (config.profileType === 'cascading') {
+                const k = Math.max(1, config.cascadeSteps);
+                const dz = (config.cascadeDrop * r_max) / k;
+                _vertexPosHelper.z -= dz * 0.5;    // sink roofs half a step
+            }
 
             topPositions.push(
                 _vertexPosHelper.x,
@@ -1167,11 +1202,11 @@ function updateDomeGeometry() {
 
     // --- 5. Create Mesh with Multiple Materials ---
     domeMaterials.wall = new THREE.MeshStandardMaterial({
-        color: 0xaaaaaa, // Neutral grey for walls
+        color: 0xFF8C00, // Changed to orange for extruded walls
         side: THREE.DoubleSide,
         metalness: 0.1, roughness: 0.8,
         opacity: config.faceOpacity, transparent: config.faceOpacity < 1.0,
-        polygonOffset: true, polygonOffsetFactor: 1.1, polygonOffsetUnits: 1 // Offset slightly more than faces
+        polygonOffset: true, polygonOffsetFactor: 0.5, polygonOffsetUnits: 1 // Offset slightly more than faces // REDUCED polygonOffsetFactor
     });
      domeMaterials.thinRoof = new THREE.MeshStandardMaterial({
          color: config.faceColor1,
@@ -1352,13 +1387,23 @@ function setupGUI() {
     const extrudeFolder = gui.addFolder('Dome Extrusion');
     guiControllers.domeToggle = extrudeFolder.add(config, 'extrudeDome').name('Enable Dome').onChange(updateVisibility);
     guiControllers.domeRadius = extrudeFolder.add(config, 'domeRadius', 0.1, 30, 0.1).name('Dome Radius (R)').onChange(updateDomeGeometry).listen(); // Use temporary wide range initially
-    guiControllers.profileType = extrudeFolder.add(config, 'profileType', ['spherical', 'eased', 'stepped']).name('Profile Type').onChange(updateDomeGeometry);
-    guiControllers.tierCount = extrudeFolder.add(config, 'tierCount', 1, 20, 1).name('Tier Count').onChange(updateDomeGeometry).listen(); // For stepped
-    guiControllers.stepHeight = extrudeFolder.add(config, 'stepHeight', 0.01, 10, 0.01).name('Step Height') // Use temporary wide range initially
+    guiControllers.profileType = extrudeFolder.add(config, 'profileType', ['spherical', 'eased', 'stepped', 'cascading']).name('Profile Type').onChange(updateDomeGeometry);
+    guiControllers.tierCount = extrudeFolder.add(config, 'tierCount', 1, 20, 1).name('Tier Count (Stepped)').onChange(updateDomeGeometry).listen(); // For stepped
+    guiControllers.stepHeight = extrudeFolder.add(config, 'stepHeight', 0.01, 10, 0.01).name('Step Height (Stepped)') // Use temporary wide range initially
                  .onChange(v => { config._stepHeightUserSet = true; updateDomeGeometry(); })
                  .listen(); // For stepped
 
-    const tiltFolder = extrudeFolder.addFolder('Tilt');
+    // --- NEW: Cascading Profile Controls ---
+    const cascadeFolder = extrudeFolder.addFolder('Cascading Profile');
+    guiControllers.cascadeSteps = cascadeFolder.add(config, 'cascadeSteps', 1, 50, 1).name('Cascade Steps').onChange(updateDomeGeometry).listen();
+    guiControllers.cascadeDrop = cascadeFolder.add(config, 'cascadeDrop', 0.01, 2.0, 0.01).name('Cascade Drop (× r_max)').onChange(updateDomeGeometry).listen();
+    guiControllers.tiltInnerDeg = cascadeFolder.add(config, 'tiltInnerDeg', -90, 90, 0.5).name('Tilt Inner (°)')
+        .onChange(updateDomeGeometry).listen();
+    guiControllers.tiltOuterDeg = cascadeFolder.add(config, 'tiltOuterDeg', -90, 90, 0.5).name('Tilt Outer (°)')
+        .onChange(updateDomeGeometry).listen();
+    // cascadeFolder.open(); // Optionally open by default
+
+    const tiltFolder = extrudeFolder.addFolder('Tilt (General)');
     guiControllers.tiltDeg = tiltFolder
        .add(config, 'tiltDeg', -80, 80, 0.5)
        .name('Tilt Toward Centre (°)')
@@ -1400,7 +1445,8 @@ function init() {
     controls.target.set(0, 0, 0); // Target the origin in the XY plane
     controls.update();
 
-    // --- Lighting (Simple setup for 2D) ---\
+    // --- Lighting (Simple setup for 2D) ---
+    /* OLD LIGHTING - replaced
     const ambientLight = new THREE.AmbientLight(0x707070); // Slightly brighter ambient
     scene.add(ambientLight);
     const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9);
@@ -1409,9 +1455,22 @@ function init() {
     const directionalLight2 = new THREE.DirectionalLight(0xffffff, 0.3);
      directionalLight2.position.set(-1, -1, 1).normalize(); // Fill light
      scene.add(directionalLight2);
+    */
+
+    // New lighting setup
+    const newAmbientLight = new THREE.AmbientLight(0x606060); // Soft ambient
+    scene.add(newAmbientLight);
+
+    const keyLight = new THREE.DirectionalLight(0xffccaa, 1.0); // Warm, from above
+    keyLight.position.set(0.5, 0.5, 2); // More directly from above
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(0xaaccff, 0.4); // Cool fill, from side
+    fillLight.position.set(-1, 0.5, 0.5);
+    scene.add(fillLight);
 
 
-    // --- Axes Helper (Optional) ---\
+    // --- Axes Helper (Optional) ---
     const axesHelper = new THREE.AxesHelper(5);
     scene.add(axesHelper);
 
