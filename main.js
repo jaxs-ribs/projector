@@ -72,7 +72,7 @@ import GUI from 'lil-gui';
 // Configuration & Global State
 // =============================================================================
 
-const MAX_ACCEPTED_VERTS = 50000; // NEW: Safety limit for vertex generation
+// const MAX_ACCEPTED_VERTS = 50000; // REMOVED: Performance guard, less needed for multigrid?
 
 const config = {
     // --- Mathematical Constants ---
@@ -97,6 +97,7 @@ const config = {
 
     // --- Extrusion Parameters (UI controllable) ---
     extrudeDome: false,         // Toggle extrusion view
+    generatorMode : 'multigrid',   // 'candp' | 'multigrid'
     domeRadius: 6.0,           // Target dome radius (TEMPORARY default, calculated later)
     profileType: 'cascading',   // 'spherical', 'eased', 'stepped', 'cascading'
     tierCount: 5,               // For 'stepped' profile
@@ -243,7 +244,7 @@ function calculateProjectionMatrices() {
     const internalDim = N - 2;
 
     console.log(`Setting up generic Fourier basis for N=${N} (${internalDim}D internal space)...`);
-    const norm = 1 / Math.sqrt(N);
+    const norm = 1; // we keep columns orthonormal later – do not pre-shrink
 
     // --- Physical plane (m = 1 Fourier mode) ---
     const P_PHYS_matrix = [[], []]; // 2xN
@@ -495,7 +496,8 @@ function performGeneration() {
                     N_k_array[i] = 0; // Default to 0 to avoid crashing, though results might be wrong
                 }
             }
-            const offset = 0.5 * internalDot(N_k_array, N_k_array); // ||N_k||² / 2
+            // const offset = 0.5 * internalDot(N_k_array, N_k_array); // OLD: ||N_k||² / 2
+            const offset = 0.5;      // half-width of each acceptance strip in raw coordinates
             windowPlanes.push({ normal: N_k_array, offset: offset });
         }
         console.log(` -> ${windowPlanes.length} window planes computed.`);
@@ -524,6 +526,7 @@ function performGeneration() {
         : (config.extent + 0.5) * Math.sqrt(internalDim > 0 ? internalDim : 1); // Fallback if planes not ready or internalDim is 0
     const maxInternalRadiusSq = maxInternalNormBound * maxInternalNormBound;
     let preCheckSkipped = 0;
+    const HARD_VERTEX_LIMIT = 75000;
 
     // --- Iterate through the N-D integer lattice ---\
     // Recursive generator for iterating through N-dimensional hypercube
@@ -566,15 +569,10 @@ function performGeneration() {
                 internal: pInternal // Store (N-2)D internal coordinates (optional)
             });
             acceptedCount++;
-
-            // --- NEW: Performance Guard ---
-            if (acceptedCount > MAX_ACCEPTED_VERTS) {
-                console.warn(`Vertex generation limit (${MAX_ACCEPTED_VERTS}) reached. Stopping lattice scan early.`);
-                break; // Exit the innermost loop (over pND)
-            }
+            if (acceptedCount >= HARD_VERTEX_LIMIT) { console.warn(`C&P vertex cap (${HARD_VERTEX_LIMIT}) hit – stopping scan`); break; }
         }
-        // --- Check if the performance guard break needs to propagate upwards ---
-        if (acceptedCount > MAX_ACCEPTED_VERTS) {
+        // --- Check if the C&P HARD_VERTEX_LIMIT break needs to propagate upwards ---
+        if (acceptedCount >= HARD_VERTEX_LIMIT) {
              break; // Exit the generator loop immediately
         }
     }
@@ -660,6 +658,16 @@ function performGeneration() {
     const totalEndTime = performance.now();
     console.log(`Full generation cycle finished in ${(totalEndTime - startTime).toFixed(2)} ms.`);
     console.info(`Generation summary: verts=${acceptedPointsData.length}, edges=${generatedEdges.length}, faces=${generatedFaces.length}`);
+}
+
+// --- NEW: Generator Wrapper ---
+function generateGeometry() {
+    console.log(`Generating geometry using mode: ${config.generatorMode}`);
+    if (config.generatorMode === 'candp') {
+        performGeneration();        // old cut-and-project
+    } else {
+        performMultigridGeneration();  // new function, see step 5
+    }
 }
 
 // =============================================================================
@@ -1414,9 +1422,14 @@ function updateVisibility() {
         // Overall mesh container is visible if dome is on
         domeMeshObject.visible = showDome;
         // Control roof visibility via materials
-        if (domeMaterials.thinRoof) domeMaterials.thinRoof.visible = config.showFaces;
-        if (domeMaterials.thickRoof) domeMaterials.thickRoof.visible = config.showFaces;
-        if (domeMaterials.unknownRoof) domeMaterials.unknownRoof.visible = config.showFaces; // Also hide degenerate roofs
+        // if (domeMaterials.thinRoof) domeMaterials.thinRoof.visible = config.showFaces; // OLD
+        // if (domeMaterials.thickRoof) domeMaterials.thickRoof.visible = config.showFaces; // OLD
+        // if (domeMaterials.unknownRoof) domeMaterials.unknownRoof.visible = config.showFaces; // OLD
+        Object.entries(domeMaterials).forEach(([key, mat])=>{ // NEW dynamic iteration
+            if (!mat) return; // Skip if material somehow null/undefined
+            if (key === 'wall') return;          // wall visibility is handled separately (always on)
+            mat.visible = config.showFaces;
+        });
         // Keep walls always visible when dome is visible (or add separate toggle)
         if (domeMaterials.wall) domeMaterials.wall.visible = true;
     }
@@ -1469,10 +1482,37 @@ function setupGUI() {
         // Rebuild the shift GUI dynamically
         rebuildShiftGUI(genFolder);
 
-        performGeneration();           
+        generateGeometry(); // NEW CALL
     });
-    guiControllers.extent = genFolder.add(config, 'extent', 1, 7, 1).name('Lattice Extent (per dim)').onChange(performGeneration); 
-    guiControllers.windowScale = genFolder.add(config, 'windowScale', 0.1, 3.0, 0.05).name('Window Scale').onChange(performGeneration);
+    guiControllers.extent = genFolder.add(config, 'extent', 1, 7, 1).name('Lattice Extent (per dim)').onChange(generateGeometry); // NEW CALL
+    guiControllers.windowScale = genFolder.add(config, 'windowScale', 0.1, 3.0, 0.05).name('Window Scale').onChange(generateGeometry); // NEW CALL
+
+    // --- NEW: Generator Mode Selector ---
+    guiControllers.generatorMode = genFolder.add(config, 'generatorMode', ['multigrid', 'candp'])
+       .name('Generator')
+       .onChange(value => {
+            // Enable/disable C&P specific controls
+            const isCandP = (value === 'candp');
+            if (guiControllers.windowScale) guiControllers.windowScale.enable(isCandP);
+            // Enable/disable shift controls (need access to the dynamically created ones)
+            if (shiftFolder && shiftFolder.controllers) { // NEW Check
+                 shiftFolder.controllers.forEach(c => c.enable(isCandP));
+            }
+            // Regenerate
+            generateGeometry();
+            // --- NEW: Disable pointer events on C&P controls when in multigrid mode ---
+            if (guiControllers.windowScale && guiControllers.windowScale.domElement && guiControllers.windowScale.domElement.parentElement) {
+                guiControllers.windowScale.domElement.parentElement.style.pointerEvents = isCandP ? 'auto' : 'none';
+            }
+            // Apply to shiftFolder controllers as well
+            if (shiftFolder && shiftFolder.controllers) {
+                shiftFolder.controllers.forEach(c => {
+                    if (c.domElement && c.domElement.parentElement) {
+                        c.domElement.parentElement.style.pointerEvents = isCandP ? 'auto' : 'none';
+                    }
+                });
+            }
+       });
 
     // --- Internal Window Shift Sub-Folder (Dynamically Built) ---
     let shiftFolder = null; // Keep reference to folder
@@ -1499,7 +1539,7 @@ function setupGUI() {
                  const axis = ['X', 'Y', 'Z'][i];
                  shiftFolder.add(config.windowShiftInternal, i, -shiftRange, shiftRange, 0.01)
                      .name(`Shift ${axis}`)
-                     .onChange(performGeneration)
+                     .onChange(generateGeometry) // NEW CALL
                      .listen();
             } else {
                 // Optionally add disabled display or hide for dims > 3?
@@ -1512,6 +1552,13 @@ function setupGUI() {
 
     rebuildShiftGUI(genFolder); // Initial build
     // genFolder.open(); // Keep top-level folder open
+
+    // --- Initial enable/disable based on default mode ---
+    const initialIsCandP = (config.generatorMode === 'candp');
+    if (guiControllers.windowScale) guiControllers.windowScale.enable(initialIsCandP);
+    if (shiftFolder && shiftFolder.controllers) { // NEW Check
+        shiftFolder.controllers.forEach(c => c.enable(initialIsCandP));
+    }
 
     // --- Visualization Parameters Folder ---
     const vizFolder = gui.addFolder('Visualization');
@@ -1671,7 +1718,7 @@ function init() {
     // --- Initial Calculations & Setup ---\
     calculateProjectionMatrices(); // Must be called before generation
     setupGUI();                    // Create the UI panel
-    performGeneration();           // Generate initial tiling
+    generateGeometry(); // NEW CALL
 
     // --- Event Listeners ---\
     window.addEventListener('resize', onWindowResize, false);
@@ -1704,3 +1751,295 @@ function render() {
 
 init();
 animate();
+
+// --- NEW: Multigrid Generator (Skeleton) ---
+/**
+ * Fast De Bruijn (multigrid) generator.
+ * Complexity  O(N² · tiles)  ≈ linear in visible area.
+ */
+function performMultigridGeneration() {
+    console.log("Starting Multigrid generation...");
+    const startTime = performance.now();
+
+    const N   = config.nSym;
+    const R   = config.extent * 1.2; // view radius in world units (Adjust multiplier as needed)
+    console.log(` -> N = ${N}, View Radius R ≈ ${R.toFixed(2)}`);
+
+    // Check for N<3 (though config should handle it)
+    if (N < 3) {
+        console.error("Multigrid requires N >= 3.");
+        // Clear visuals? Or maybe just show nothing.
+        acceptedPointsData = []; generatedEdges = []; generatedFaces = [];
+        updatePointsObject(); updateEdgesObject(); updateFacesObject(); updateDomeGeometry(); updateVisibility();
+        return;
+    }
+
+    const dir = []; // unit directions u_k
+    for (let k = 0; k < N; k++) {
+        const th = 2 * Math.PI * k / N;
+        dir.push(new THREE.Vector2(Math.cos(th), Math.sin(th)));
+    }
+
+    // 1) pick N random offsets (phase between neighbouring parallel lines)
+    // Use goldenRatio for quasi-randomness related to Penrose?
+    // const offs = Array.from({length:N}, (_, k) => (k * config.goldenRatio) % 1.0); // OLD explicit golden ratio
+    // const offs = Array.from({length:N}, () => Math.random()); // OLD Simpler: random [0, 1)
+    const offs = Array.from({length:N}, (_,k)=> (k+1)*config.tau % 1);   // deterministic & incommensurate
+    // Scale offsets? Playbook mentions config.tau, but using [0,1) is common.
+    // Let's stick to random [0,1) for now.
+    console.log(" -> Random offsets:", offs.map(o => o.toFixed(3)));
+
+    // clear result containers
+    acceptedPointsData = [];
+    generatedEdges     = [];
+    generatedFaces     = [];
+
+    const vMap = new Map();   // key = `${x.toFixed(5)},${y.toFixed(5)}` → pointID
+    const idToPointMap = new Map(); // Need this to retrieve point data later
+
+    // --- Data Structures for Edge/Face Finding ---
+    // lineMap: Map familyIndex (k) => Map ( lineIndex (m) => [{id, t}] ) - for sorting points along lines
+    const lineMap = new Map(); 
+    // vertexLookupByLines: Map key=`${i}:${m}_${j}:${n}` -> id - for finding face corners (built using all families point belongs to)
+    const vertexLookupByLines = new Map(); 
+
+    // 2) iterate over unordered pairs (i,j) to find intersection vertices
+    console.log("Finding vertices (intersections)... ");
+    let nextId = 0;
+    for (let i = 0; i < N; i++) {
+        if (dir[i].lengthSq() === 0) continue;   // safety; never hit but helps V8 inline
+        for (let j = i+1; j < N; j++) {
+
+            const d  = dir[i];
+            const e  = dir[j];
+            const D  = d.x*e.y - d.y*e.x; // det(d, e)
+            if (Math.abs(D) < 1e-6) { // Check determinant
+                console.warn(`Skipping parallel directions i=${i}, j=${j}`);
+                continue; // Skip parallel vectors
+            }
+
+            // Solve A * [x y]^T = b for each integer pair (m,n)
+            // Where b = [m + offs_i, n + offs_j]^T (shifted grid lines)
+            // A = [[d.x, d.y], [e.x, e.y]] ? NO, should be: d.x*x+d.y*y = m+offs[i] etc.
+            // Let's rewrite based on dual grid lines u_k · x = m_k + gamma_k
+            // u_i · x = m + offs[i]
+            // u_j · x = n + offs[j]
+            // [ dir[i].x  dir[i].y ] [x] = [m + offs[i]]
+            // [ dir[j].x  dir[j].y ] [y]   [n + offs[j]]
+            // Let M = [[di.x, di.y], [dj.x, dj.y]]
+            // det(M) = di.x*dj.y - di.y*dj.x (same as D calculated above)
+            const detM = D;
+            const invDet = 1.0 / detM;
+            // Inverse M = (1/det) * [[dj.y, -di.y], [-dj.x, di.x]]
+            const M_inv_11 =  e.y * invDet;
+            const M_inv_12 = -d.y * invDet;
+            const M_inv_21 = -e.x * invDet;
+            const M_inv_22 =  d.x * invDet;
+
+            // Estimate index range (over-approximate)
+            // Max value of m+offs[i] occurs roughly when x points along dir[i] with length R
+            // So, m_max ~ R + offs[i]. Similarly for n_max.
+            // A tighter bound might be possible.
+            const mMin = Math.floor(-R - offs[i]); // Use floor/ceil for safety
+            const mMax = Math.ceil( R - offs[i]);
+            const nMin = Math.floor(-R - offs[j]);
+            const nMax = Math.ceil( R - offs[j]);
+
+            for (let m = mMin; m <= mMax; m++) {
+                for (let n = nMin; n <= nMax; n++) {
+
+                    const b1 = m + offs[i]; // Target value for line i
+                    const b2 = n + offs[j]; // Target value for line j
+
+                    // Solve [x, y]^T = M_inv * [b1, b2]^T
+                    const x = M_inv_11 * b1 + M_inv_12 * b2;
+                    const y = M_inv_21 * b1 + M_inv_22 * b2;
+
+                    // Check if vertex is within the view radius
+                    if (x*x + y*y > R*R * 1.01) continue; // Add tolerance
+
+                    const key = `${x.toFixed(5)},${y.toFixed(5)}`;
+                    let pointData = vMap.get(key);
+                    let currentId;
+
+                    if (pointData === undefined) {
+                        currentId = nextId++;
+                        const physVec = new THREE.Vector2(x, y);
+                        const newPoint = {
+                            id: currentId,
+                            lattice: null, 
+                            phys: physVec,
+                            lineIndices: {} // Store { familyIndex: lineIndex } for ALL families
+                        };
+                        // Calculate line indices for ALL families for this new point
+                        for (let k = 0; k < N; k++) {
+                            // Rounding might be needed due to float precision
+                            const lineVal = dir[k].dot(physVec) - offs[k]; 
+                            // Use Math.round to get the nearest integer index m_k
+                            newPoint.lineIndices[k] = Math.round(lineVal);
+                        }
+                        
+                        acceptedPointsData.push(newPoint);
+                        vMap.set(key, newPoint);
+                        idToPointMap.set(currentId, newPoint);
+                        pointData = newPoint;
+
+                        // Populate vertexLookupByLines for all pairs involving this point
+                        const p_indices = pointData.lineIndices;
+                        const families = Object.keys(p_indices).map(Number);
+                        for (let fi = 0; fi < families.length; fi++) {
+                            for (let fj = fi + 1; fj < families.length; fj++) {
+                                const f1 = families[fi];
+                                const f2 = families[fj];
+                                const m1 = p_indices[f1];
+                                const m2 = p_indices[f2];
+                                // Ensure canonical order i < j for the key
+                                const keyI = Math.min(f1,f2); const keyJ = Math.max(f1,f2);
+                                const keyM = (keyI === f1) ? m1 : m2;
+                                const keyN = (keyJ === f2) ? m2 : m1;
+                                const lookupKey = `${keyI}:${keyM}_${keyJ}:${keyN}`;
+                                vertexLookupByLines.set(lookupKey, currentId);
+                            }
+                        }
+                    } else {
+                        // Point already existed (intersection of other lines)
+                        currentId = pointData.id;
+                        // Ensure its lineIndices are fully populated (might have been created by a different pair)
+                        if (Object.keys(pointData.lineIndices).length < N) {
+                            for (let k = 0; k < N; k++) {
+                                if (pointData.lineIndices[k] === undefined) {
+                                     const lineVal = dir[k].dot(pointData.phys) - offs[k]; 
+                                     pointData.lineIndices[k] = Math.round(lineVal);
+                                }
+                            }
+                            // Re-populate vertexLookupByLines just in case (though less critical here)
+                            const p_indices = pointData.lineIndices;
+                            const families = Object.keys(p_indices).map(Number);
+                            for (let fi = 0; fi < families.length; fi++) {
+                                for (let fj = fi + 1; fj < families.length; fj++) {
+                                     const f1 = families[fi];
+                                     const f2 = families[fj];
+                                     const m1 = p_indices[f1];
+                                     const m2 = p_indices[f2];
+                                     const keyI = Math.min(f1,f2); const keyJ = Math.max(f1,f2);
+                                     const keyM = (keyI === f1) ? m1 : m2;
+                                     const keyN = (keyJ === f2) ? m2 : m1;
+                                     const lookupKey = `${keyI}:${keyM}_${keyJ}:${keyN}`;
+                                     if (!vertexLookupByLines.has(lookupKey)) {
+                                         vertexLookupByLines.set(lookupKey, currentId);
+                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // Populate lineMap for edge finding (using projection orthogonal to line dir for sorting)
+                    for(let k = 0; k < N; k++) {
+                         // const m_k = pointData.lineIndices[k]; // OLD
+                         const m_k = Number(pointData.lineIndices[k]);   // ← force numeric key
+                         const t_param_k = -dir[k].y * x + dir[k].x * y; // Project onto orthogonal
+                         if (!lineMap.has(k)) lineMap.set(k, new Map());
+                         if (!lineMap.get(k).has(m_k)) lineMap.get(k).set(m_k, []);
+                         // Avoid adding duplicate points to the same line list
+                         if (!lineMap.get(k).get(m_k).some(p => p.id === currentId)) {
+                             lineMap.get(k).get(m_k).push({ id: currentId, t: t_param_k });
+                         }
+                    }
+                }
+            }
+        }
+    }
+    console.log(` -> Found ${acceptedPointsData.length} unique vertices.`);
+
+    // --- Process lineMap to generate edges ---
+    console.log("Generating edges from lineMap...");
+    const edgeSet = new Set(); // To avoid duplicates
+    for (const [familyIndex, lines] of lineMap.entries()) {
+        for (const [lineIndex, pointsOnLine] of lines.entries()) {
+            // Sort points along the line based on parameter t
+            pointsOnLine.sort((a, b) => a.t - b.t);
+            // Create edges between consecutive points
+            for (let k = 0; k < pointsOnLine.length - 1; k++) {
+                const id1 = pointsOnLine[k].id;
+                const id2 = pointsOnLine[k+1].id;
+                const edgeKey = id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`;
+                if (!edgeSet.has(edgeKey)) {
+                    generatedEdges.push({ v1: id1, v2: id2 });
+                    edgeSet.add(edgeKey);
+                }
+            }
+        }
+    }
+    console.log(` -> Generated ${generatedEdges.length} unique edges.`);
+
+    // --- Build faces from line indices ---
+    console.log("Generating faces...");
+    const faceSet = new Set(); // Avoid duplicates
+    const maxRhombTypeIndex = Math.floor(N / 2);
+
+    // Iterate through all pairs of families (i, j)
+    for (let i = 0; i < N; i++) {
+        for (let j = i + 1; j < N; j++) {
+            // Iterate through relevant line indices m (for family i)
+            if (!lineMap.has(i)) continue;
+            for (const m of lineMap.get(i).keys()) {
+                 // Iterate through relevant line indices n (for family j)
+                 if (!lineMap.has(j)) continue; // Should not happen if i has lines
+                 for (const n of lineMap.get(j).keys()) {
+                     // Check if vertex (m,n) for families (i,j) exists
+                     const key0 = `${i}:${m}_${j}:${n}`;
+                     const id0 = vertexLookupByLines.get(key0);
+                     if (id0 === undefined) continue;
+
+                     // Look for neighbours
+                     const key1 = `${i}:${m + 1}_${j}:${n}`;
+                     const key2 = `${i}:${m}_${j}:${n + 1}`;
+                     const key3 = `${i}:${m + 1}_${j}:${n + 1}`;
+
+                     const id1 = vertexLookupByLines.get(key1);
+                     const id2 = vertexLookupByLines.get(key2);
+                     const id3 = vertexLookupByLines.get(key3);
+
+                     if (id1 !== undefined && id2 !== undefined && id3 !== undefined) {
+                         // Found a potential rhombus: (id0, id1, id3, id2)
+                         const vertexIds = [id0, id1, id3, id2];
+                         const canonicalKey = vertexIds.slice().sort((a,b)=>a-b).join('-');
+
+                         if (!faceSet.has(canonicalKey)) {
+                             faceSet.add(canonicalKey);
+                             const typeIndex = Math.min(j - i, N - (j - i)); // Canonical type index
+                             if (typeIndex > 0 && typeIndex <= maxRhombTypeIndex) {
+                                 const type = `rhomb_d${typeIndex}`;
+                                 generatedFaces.push({ vertices: vertexIds, type: type });
+                             } else {
+                                 // Should not happen for i != j and N >= 3
+                                 console.warn(`Degenerate face found? i=${i}, j=${j}, N=${N}, typeIndex=${typeIndex}`);
+                             }
+                         }
+                     }
+                 }
+            }
+        }
+    }
+    console.log(` -> Generated ${generatedFaces.length} potential faces.`);
+
+    // 4) continue rendering pipeline
+    console.log("Updating visuals...");
+    // Calculate r_max based on generated points
+    r_max = 0;
+    acceptedPointsData.forEach(pt => {
+        r_max = Math.max(r_max, pt.phys.length());
+    });
+    console.log(` -> Multigrid Max radial extent (r_max): ${r_max.toFixed(4)}`);
+
+    // Update Three.js objects
+    updatePointsObject();
+    updateEdgesObject();
+    updateFacesObject(); // Will be empty if face generation skipped
+    updateDomeGeometry(); // Requires faces
+    updateVisibility();
+
+    const endTime = performance.now();
+    console.log(`Multigrid generation finished in ${(endTime - startTime).toFixed(2)} ms.`);
+    console.info(`Multigrid summary: verts=${acceptedPointsData.length}, edges=${generatedEdges.length}, faces=${generatedFaces.length}`);
+}
