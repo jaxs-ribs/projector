@@ -253,8 +253,8 @@ const config = {
 
     // --- Dome Extrusion Parameters ---
     extrudeDome: false,
-    domeRadius: 6.0,
-    profileType: 'spherical',    // ['spherical','eased','stepped','cascading']
+    domeRadius: 24.0,          // Was 6.0, now matches maxDrawRadius
+    profileType: 'stepped',    // ['spherical','eased','stepped','cascading']
     tierCount: 5,
     stepHeight: 1.0,
     tiltDeg: 0.0,
@@ -268,7 +268,8 @@ const config = {
 
     // --- Bevel Parameters (NEW) ---
     bevelRatio: 0.1,        // fraction of total dome height reserved for the bevel step
-    bevelSteps: 1           // Optional: controls how many linear interpolation steps for bevel
+    bevelSteps: 1,           // Optional: controls how many linear interpolation steps for bevel
+    domeShape: 'full'       // NEW: ['full', 'half', 'quarter'] controls base shape before extrusion
 };
 
 // --- Global Three.js Variables ---
@@ -303,6 +304,117 @@ let stepHeightController = null;
 // Scratch objects
 const _vec2_1 = new THREE.Vector2();
 const _vec2_2 = new THREE.Vector2();
+
+// =============================================================================
+// Shareable Link Functions (NEW)
+// =============================================================================
+
+function generateShareURL() {
+    try {
+        // Create a subset of config to share to avoid very large URLs if some parts are complex or unnecessary
+        // For now, sharing the whole config. Consider curating this list if URLs become too long.
+        const configToShare = { ...config };
+
+        // Remove non-essential or very large data if necessary - for example:
+        // delete configToShare.faceColors; // If default colors are always desired on share, or if this array is huge
+
+        const configString = JSON.stringify(configToShare);
+        const encodedConfig = btoa(configString); // Base64 encode
+        
+        // Use window.location.origin + window.location.pathname for a robust base URL
+        const baseURL = window.location.origin + window.location.pathname;
+        const shareUrl = baseURL + '#' + encodedConfig;
+        return shareUrl;
+    } catch (error) {
+        console.error("Error generating share URL:", error);
+        return null;
+    }
+}
+
+function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+            .then(() => {
+                alert("Share link copied to clipboard!");
+                console.log("Share link copied:", text);
+            })
+            .catch(err => {
+                console.error("Failed to copy share link:", err);
+                alert("Failed to copy link. See console for details. Ensure you are in a secure context (HTTPS or localhost) for clipboard access.");
+            });
+    } else {
+        // Fallback for older browsers or non-secure contexts
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.style.position = "fixed";
+        textArea.style.left = '-9999px'; // Move off-screen
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        try {
+            const successful = document.execCommand('copy');
+            if (successful) {
+                alert("Share link copied to clipboard (fallback method)!");
+                console.log("Share link copied (fallback):", text);
+            } else {
+                throw new Error('Fallback copy command failed.');
+            }
+        } catch (err) {
+            console.error("Fallback copy failed:", err);
+            alert("Failed to copy link using fallback. See console.");
+        }
+        document.body.removeChild(textArea);
+    }
+}
+
+// =============================================================================
+// Config Loading from URL (NEW)
+// =============================================================================
+function loadConfigFromURL() {
+    if (window.location.hash && window.location.hash.length > 1) {
+        try {
+            const encodedConfig = window.location.hash.substring(1); // Remove #
+            const decodedConfigString = atob(encodedConfig); // Base64 decode
+            const loadedConfig = JSON.parse(decodedConfigString);
+
+            // Smart merge: update global `config` with values from `loadedConfig`
+            // This preserves defaults for any params not in the share link
+            // and handles cases where new params were added to the code since link creation.
+            Object.keys(loadedConfig).forEach(key => {
+                if (config.hasOwnProperty(key)) {
+                    // Basic type check to prevent major issues. More sophisticated validation might be needed.
+                    if (typeof config[key] === typeof loadedConfig[key] || loadedConfig[key] === null) {
+                        config[key] = loadedConfig[key];
+                    } else if (Array.isArray(config[key]) && Array.isArray(loadedConfig[key])){
+                        config[key] = loadedConfig[key]; // Replace arrays directly
+                    } else {
+                        console.warn(`Type mismatch for config key "${key}" ('${typeof loadedConfig[key]}' vs '${typeof config[key]}'). Keeping default.`);
+                    }
+                } else {
+                    console.warn(`Config key "${key}" from URL not found in current default config. Ignoring.`);
+                }
+            });
+            
+            // Re-initialize PRNG if seed was loaded
+            if (loadedConfig.hasOwnProperty('seed')) {
+                initializePRNG(); // Uses the new config.seed
+            }
+
+            console.log("Configuration loaded from URL hash:", JSON.parse(JSON.stringify(config))); // Log a clone
+            // Optional: Clear the hash to make the URL cleaner after loading.
+            // Be cautious: if user refreshes, loaded config will be gone unless they have the original link.
+            // window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+            return true; 
+        } catch (error) {
+            console.error("Error loading or parsing config from URL hash:", error);
+            alert("Error loading shared configuration. Using defaults. See console for details.");
+            // Clear a potentially corrupted hash to prevent re-triggering this error on refresh
+            window.location.hash = ''; 
+            return false;
+        }
+    }
+    return false; 
+}
 
 // -----------------------------------------------------------------------------
 // Camera-based radius helper
@@ -522,6 +634,14 @@ function performMultigridGeneration() {
 
                     const x = (val_i * n_j.y - val_j * n_i.y) / den;
                     const y = (val_j * n_i.x - val_i * n_j.x) / den;
+
+                    // --- Filter vertices based on domeShape --- (before maxDrawRadius and clipping)
+                    if (config.domeShape === 'half') {
+                        if (y < -config.epsilon_ui) continue; // Allow points on or very near the y=0 axis
+                    } else if (config.domeShape === 'quarter') {
+                        if (x < -config.epsilon_ui || y < -config.epsilon_ui) continue; // Allow points on or very near x=0 or y=0 axes
+                    }
+                    // --- End Filter ---
 
                     // Filter vertices beyond maxDrawRadius
                     if (Math.hypot(x, y) > config.maxDrawRadius) continue;
@@ -1376,30 +1496,32 @@ function setupGUI() {
     gui = new GUI();
     gui.title("Multigrid Tiling (Rev 2)");
 
+    const shareParams = {
+        shareLink: function() {
+            const url = generateShareURL();
+            if (url) {
+                copyToClipboard(url);
+            }
+        }
+    };
+
+    gui.add(shareParams, 'shareLink').name("Copy Share Link"); // Add Share button at the top
+
     const regen = () => {
         performMultigridGeneration();
     };
 
-    const updateTransforms = () => { // Renamed from updateTransformsAndEdges
+    const updateTransforms = () => { 
         applyGlobalTransforms();
-        // updateMainEdgesObject(); // REMOVED Call
-    };
-
-    const updateBasicVis = () => { // Renamed from updateVisAndEdges
-        // Face material opacity updates removed
-        // Edge color updates removed
-        updateVisibility(); // This now only handles vertex points
-        // updateMainEdgesObject(); // REMOVED Call
     };
 
     const genFolder = gui.addFolder('Generation Parameters (§1)');
     genFolder.add(config, 'N', 3, 33, 1).name('Symmetry (N)').onFinishChange(regen);
-    genFolder.add(config, 'phi', 0, 0.9999, 0.001).name('Phase (φ)').onFinishChange(regen); // Max < 1
+    genFolder.add(config, 'phi', 0, 0.9999, 0.001).name('Phase (φ)').onFinishChange(regen); 
     genFolder.add(config, 'Delta', 0, 1, 0.01).name('Disorder (Δ)').onFinishChange(regen);
-    genFolder.add(config, 'seed').name('Random Seed').onFinishChange(regen);
+    // REMOVED: genFolder.add(config, 'seed').name('Random Seed').onFinishChange(regen);
     genFolder.add(config, 'R_param', 1, 200, 1).name('Radius (R lines)').onFinishChange(regen);
     genFolder.add(config, 'maxDrawRadius', 1, 500, 1).name('Max Draw Radius').onFinishChange(regen);
-    // Epsilon is not a UI parameter per spec table 1
 
     const transformFolder = gui.addFolder('Global Transforms (§8)');
     transformFolder.add(config, 'alpha_rot', -360, 360, 1).name('Rotation (α deg)').onFinishChange(updateTransforms);
@@ -1409,75 +1531,49 @@ function setupGUI() {
 
     const vizFolder = gui.addFolder('Visualization (§9)');
     vizFolder.add(config, 'showVertices').name('Show Vertices').onChange(() => {
-        updateVertexPointsObject(); // Create/destroy points object
-        updateVisibility();       // Then ensure its visibility is set
+        updateVertexPointsObject();
+        updateVisibility();
     });
     vizFolder.add(config, 'showEdges').name('Show Edges').onChange(() => {
-        updateMainEdgesObject(); // Create/destroy edges object
-        updateVisibility();    // Then ensure its visibility is set
+        updateMainEdgesObject();
+        updateVisibility();
     });
     vizFolder.add(config, 'showFaces').name('Show Faces').onChange(() => {
-        updateMainFacesObject(); // create/destroy
-        updateVisibility();      // then apply flag
+        updateMainFacesObject();
+        updateVisibility();
     });
-    vizFolder.add(config, 'faceOpacity', 0.05, 1, 0.05).name('Face Opacity').onFinishChange(() => {
-        if (mainFacesObject && mainFacesObject.material) mainFacesObject.material.opacity = config.faceOpacity;
-        // Also need to update transparency flag if opacity hits 1 or drops below 1
-        if (mainFacesObject && mainFacesObject.material) mainFacesObject.material.transparent = config.faceOpacity < 1;
-    });
+    // REMOVED: vizFolder.add(config, 'faceOpacity', ...);
 
     vizFolder.add(config, 'globalHueShift', 0, 1, 0.01).name('Global Hue Shift').onFinishChange(applyHueShiftToFaceColors);
 
-    const faceColorsFolder = vizFolder.addFolder('Face Type Colors (Base)'); // Renamed for clarity
-    config.faceColors.forEach((color, index) => {
-        const colorObject = { color: color }; // lil-gui operates on object properties
-        faceColorsFolder.addColor(colorObject, 'color')
-            .name(`Type ${index + 1} Color`)
-            .onChange(newColor => {
-                config.faceColors[index] = newColor;
-                updateMainFacesObject(); // Re-render faces with the new color
-            });
-    });
-
-    const tuningFolder = gui.addFolder('Fine Tuning');
-    tuningFolder.add(config, 'vertexMergeDecimals', 3, 10, 1).name('Vertex Merge Precision').onFinishChange(regen);
-    tuningFolder.add(config, 'epsilon_ui', 1e-8, 1e-3, 1e-7).name('Numeric Tolerance (ε)').onFinishChange(regen);
-    tuningFolder.add(config, 'q_offset_epsilon_ui', 1e-6, 1e-1, 1e-5).name('Q Offset (εQ)').onFinishChange(regen);
-
-    // --- Dome Extrusion GUI --- 
-    const initial_r_max_for_gui = config.R_param > 0 ? config.R_param : 20; // Default if R_param is 0
+    const initial_r_max_for_gui = config.R_param > 0 ? config.R_param : 20;
 
     const domeF = gui.addFolder('Dome Extrusion');
-    domeF.add(config, 'extrudeDome').name('Enable Dome').onChange(updateDomeGeometry);
+    domeF.add(config, 'domeShape', ['full', 'half', 'quarter']).name('Dome Shape').onFinishChange(regen); // regen calls performMultigridGeneration
+    domeF.add(config, 'extrudeDome').name('Enable Dome').onChange(() => { updateDomeGeometry(); updateVisibility(); });
     
     domeRadiusController = domeF.add(config, 'domeRadius', 0.1, Math.max(0.2, 3 * initial_r_max_for_gui), 0.1).name('Radius').onFinishChange(updateDomeGeometry);
     domeF.add(config, 'profileType', ['spherical','eased','stepped','cascading']).name('Profile').onFinishChange(updateDomeGeometry);
     stepHeightController = domeF.add(config, 'stepHeight', 0.01, Math.max(0.02, initial_r_max_for_gui), 0.01).name('Step Height').onFinishChange(updateDomeGeometry);
     domeF.add(config, 'tierCount', 1, 20, 1).name('Tiers (stepped)').onFinishChange(updateDomeGeometry);
-    domeF.add(config, 'tiltDeg', -80, 80, 0.5).name('Tilt ° (spherical/eased)').onFinishChange(updateDomeGeometry); // Updated name
-    domeF.add(config, 'tiltInnerDeg', -90, 90, 1).name('Inner Tilt ° (stepped/casc.)').onFinishChange(updateDomeGeometry); // Moved & Renamed
-    domeF.add(config, 'tiltOuterDeg', -90, 90, 1).name('Outer Tilt ° (stepped/casc.)').onFinishChange(updateDomeGeometry); // Moved & Renamed
-
-    // --- Bevel GUI (NEW) ---
+    domeF.add(config, 'tiltDeg', -80, 80, 0.5).name('Tilt ° (spherical/eased)').onFinishChange(updateDomeGeometry);
+    domeF.add(config, 'tiltInnerDeg', -90, 90, 1).name('Inner Tilt ° (stepped/casc.)').onFinishChange(updateDomeGeometry);
+    domeF.add(config, 'tiltOuterDeg', -90, 90, 1).name('Outer Tilt ° (stepped/casc.)').onFinishChange(updateDomeGeometry);
+ 
     domeF
       .add(config, 'bevelRatio', 0, 0.5, 0.01)
         .name('Bevel Ratio')
         .onFinishChange(updateDomeGeometry);
-    domeF
-      .add(config, 'bevelSteps', 1, 5, 1)
-        .name('Bevel Steps')
-        .onFinishChange(updateDomeGeometry);
-    // --- End Bevel GUI ---
+    // REMOVED: domeF.add(config, 'bevelSteps', ...);
 
     const casF = domeF.addFolder('Cascading Profile Settings');
     casF.add(config, 'cascadeSteps', 1, 50, 1).name('Steps').onFinishChange(updateDomeGeometry);
-    casF.add(config, 'cascadeDrop', 0.01, 2, 0.01).name('Drop Factor (× r_max)').onFinishChange(updateDomeGeometry); // Clarified name
+    casF.add(config, 'cascadeDrop', 0.01, 2, 0.01).name('Drop Factor (× r_max)').onFinishChange(updateDomeGeometry);
 
     genFolder.open();
     transformFolder.open();
-    vizFolder.open(); // Let's open this too by default
-    tuningFolder.open();
-    domeF.open(); // Open dome folder by default
+    vizFolder.open();
+    domeF.open();
 }
 
 function applyHueShiftToFaceColors() {
@@ -1513,12 +1609,16 @@ function applyHueShiftToFaceColors() {
 // =============================================================================
 
 function init() {
+    // --- Load config from URL first (NEW) ---
+    const loadedFromURL = loadConfigFromURL(); // We'll define this next
+
     scene = new THREE.Scene();
     // scene.background set by HTML/CSS body style
 
     // --- Initialize base HSL colors for hue shifting ---
+    // This needs to happen AFTER config might be updated from URL
     const tempColor = new THREE.Color();
-    baseFaceColorsHSL = config.faceColors.map(hexColor => {
+    baseFaceColorsHSL = config.faceColors.map(hexColor => { // ... existing code ...
         tempColor.set(hexColor);
         let hsl = { h: 0, s: 0, l: 0 };
         tempColor.getHSL(hsl);
@@ -1555,7 +1655,9 @@ function init() {
     const axesHelper = new THREE.AxesHelper(config.R_param / 5); // Scale helper to R_param
     scene.add(axesHelper);
 
-    setupGUI();
+    setupGUI(); // GUI setup will now use potentially loaded config
+
+    // Perform initial generation. If config was loaded, this uses the loaded settings.
     performMultigridGeneration();
 
     window.addEventListener('resize', onWindowResize, false);
@@ -1587,8 +1689,6 @@ init();
 
 /*
 TODO: Entrypoint
-- Bevel
-- Half sphere, quarter sphere.
 - Links with config copy
 - Publishing to site 
 */
