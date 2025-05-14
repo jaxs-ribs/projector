@@ -1689,5 +1689,13 @@ init();
 
 /*
 TODO: Entrypoint
-- Publishing to site 
+
+
+- add randomize button
+- More 3d options, like
+    - sine curves
+    - wieringa roofs? 
+- smoother edges, more bevel levels
+
+- vlm/image embedding option
 */
