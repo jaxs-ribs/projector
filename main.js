@@ -155,8 +155,20 @@ function heightProfile(u) {
     case 'eased':
       return R * u * u;
     case 'stepped':
-      const tier = Math.floor(config.tierCount * u);
-      return Math.min(R, config.stepHeight * tier);
+      const rawTierVal = config.tierCount * u;
+      const tier = Math.floor(rawTierVal);
+      const calculatedHeight = config.stepHeight * tier;
+      const finalHeight = Math.min(R, calculatedHeight);
+      // Conditional log to avoid flooding if profileType changes during processing, though unlikely here.
+      if (config.profileType === 'stepped') { 
+        console.log(
+          `Stepped Profile Debug: u=${u.toFixed(3)}, ` +
+          `tierCount=${config.tierCount}, rawTierVal=${rawTierVal.toFixed(3)}, tier=${tier}, ` +
+          `stepHeight=${config.stepHeight.toFixed(3)}, calcH=${calculatedHeight.toFixed(3)}, ` +
+          `R (domeRadius)=${R.toFixed(3)}, finalH=${finalHeight.toFixed(3)}`
+        );
+      }
+      return finalHeight;
     case 'cascading':
       const k = config.cascadeSteps;
       const stepId = Math.min(k-1, Math.floor(u * k));
@@ -168,8 +180,13 @@ function heightProfile(u) {
 }
 
 function faceTiltDeg(u) {
-  if (config.profileType !== 'cascading') return config.tiltDeg;
-  // interpolate between inner and outer tilts
+  // If profile is spherical or eased, use the global tiltDeg.
+  // Otherwise (stepped or cascading), use interpolated tilt.
+  if (config.profileType !== 'cascading' && config.profileType !== 'stepped') {
+    return config.tiltDeg;
+  }
+  
+  // Interpolate between inner and outer tilts for stepped and cascading profiles
   const t0 = config.tiltInnerDeg, t1 = config.tiltOuterDeg;
   u = Math.max(0, Math.min(1, u));
   return t1 + (t0 - t1)*(1 - u);
@@ -248,6 +265,10 @@ const config = {
 
     // --- Color Scheme Parameters ---
     globalHueShift: 0.0, // 0.0 to 1.0, maps to 0-360 degrees
+
+    // --- Bevel Parameters (NEW) ---
+    bevelRatio: 0.1,        // fraction of total dome height reserved for the bevel step
+    bevelSteps: 1           // Optional: controls how many linear interpolation steps for bevel
 };
 
 // --- Global Three.js Variables ---
@@ -1099,104 +1120,163 @@ function updateDomeGeometry() {
     return;
   }
 
-  // 4.2  Build combined position buffer
-  const baseCount = indexedPositions.length / 3; // Number of unique 2D vertices
-  const positions = [...indexedPositions]; // flat [x,y,0,…] from original 2D tiling
+  // --- Start of new logic for bevels ---
 
-  const faceTopIndexMap = new Map(); // Maps tile object to array of its top vertex global indices
-  let topIndex = baseCount; // Start indexing for new top vertices after base vertices
+  // Global positions array for the dome geometry. Starts with base vertices.
+  const positions = [...indexedPositions]; // flat [x,y,0,…] from original 2D tiling (base vertices)
+  const baseVertexCount = indexedPositions.length / 3;
   
-  Object.values(tilesData).forEach(tile => {
-    const C = tile.properties.centroid; // {x, y}
-    const u = Math.hypot(C.x, C.y) / r_max;
-    const z = heightProfile(u);
-    const tilt = THREE.MathUtils.degToRad(faceTiltDeg(u));
-    const centroidV3 = new THREE.Vector3(C.x, C.y, 0); // Convert to Vector3
-    const q = getTiltQuaternion(centroidV3, tilt);
-
-    const localTopIndices = [];
-    tile.vertices.forEach(v_obj => { // v_obj is {x,y}
-      const p = new THREE.Vector3(v_obj.x, v_obj.y, 0)
-        .sub(new THREE.Vector3(C.x, C.y, 0)) // Translate to origin for rotation
-        .applyQuaternion(q)
-        .add(new THREE.Vector3(C.x, C.y, z)); // Translate back and lift
-      positions.push(p.x, p.y, p.z);
-      localTopIndices.push(topIndex++);
-    });
-    faceTopIndexMap.set(tile, localTopIndices);
-  });
-
-  if (Object.keys(tilesData).length > 0) {
-      const sampleTileKey = Object.keys(tilesData)[0];
-      const sampleTile = tilesData[sampleTileKey];
-      if (sampleTile && sampleTile.properties) { // Ensure sampleTile and its properties exist
-        console.log(
-          'Sample tile centroid:', sampleTile.properties.centroid,
-          '→ top indices:', faceTopIndexMap.get(sampleTile)
-        );
-      }
+  // Helper function to add a new vertex to the `positions` array and return its global index.
+  // New vertices (mid and top rings) are added after the base vertices.
+  let nextAvailableGlobalIndex = baseVertexCount;
+  function addVertexAndGetGlobalIndex(x, y, z) {
+      positions.push(x, y, z);
+      return nextAvailableGlobalIndex++;
   }
 
-  // 4.3  Build index arrays
+  // Map to store the {base, mid, top} global indices for each tile's rings
+  const tileRingIndices = new Map();
+
+  // --- Iterate through each tile to generate its vertices ---
+  Object.values(tilesData).forEach(tile => {
+    if (!tile.vertexOrder || tile.vertexOrder.length === 0) {
+        console.warn("Skipping dome part for tile: missing or empty tile.vertexOrder", tile);
+        return;
+    }
+
+    const C = tile.properties.centroid; // {x, y}
+    const centroidV3 = new THREE.Vector3(C.x, C.y, 0);
+    const u = Math.hypot(C.x, C.y) / r_max;
+    const fullZ = heightProfile(u); // Total height of the tile's extrusion
+    const q = getTiltQuaternion(centroidV3, THREE.MathUtils.degToRad(faceTiltDeg(u)));
+
+    // Split fullZ into "main" + "bevel" segments
+    const bevelR = config.bevelRatio;
+    const mainHeight = fullZ * (1 - bevelR);
+    // bevelHeight is fullZ * bevelR, but we use fullZ for the top ring height.
+    // const steps = config.bevelSteps; // Not used in this simplified chamfer
+
+    const currentTileBaseIndices = tile.vertexOrder; // These are already global indices into `indexedPositions` (and thus the start of `positions`)
+    const currentTileMidIndices = [];
+    const currentTileTopIndices = [];
+
+    // 1) Base ring indices are already known (tile.vertexOrder)
+
+    // 2) Mid ring: tilt + raise to mainHeight
+    for (let i = 0; i < tile.vertices.length; i++) {
+      const v_base = tile.vertices[i]; // {x,y} - original 2D vertex
+      const p_mid = new THREE.Vector3(v_base.x, v_base.y, 0)
+        .sub(centroidV3) // Translate to centroid for rotation
+        .applyQuaternion(q)
+        .add(new THREE.Vector3(C.x, C.y, mainHeight)); // Translate back and lift to mainHeight
+      currentTileMidIndices.push(addVertexAndGetGlobalIndex(p_mid.x, p_mid.y, p_mid.z));
+    }
+
+    // 3) Top ring: inset (scale toward centroid) + tilt + raise to fullZ
+    const scaleFactor = 1 - bevelR; // e.g., 0.9 for 10% bevel
+    for (let i = 0; i < tile.vertices.length; i++) {
+      const v_base = tile.vertices[i]; // {x,y} - original 2D vertex
+      // Compute scaled‐in XY relative to centroid
+      const vx_scaled = C.x + (v_base.x - C.x) * scaleFactor;
+      const vy_scaled = C.y + (v_base.y - C.y) * scaleFactor;
+      
+      const p_top = new THREE.Vector3(vx_scaled, vy_scaled, 0)
+        .sub(centroidV3) // Translate to centroid for rotation
+        .applyQuaternion(q)
+        .add(new THREE.Vector3(C.x, C.y, fullZ)); // Translate back and lift to fullZ
+      currentTileTopIndices.push(addVertexAndGetGlobalIndex(p_top.x, p_top.y, p_top.z));
+    }
+    
+    tileRingIndices.set(tile, { 
+        base: currentTileBaseIndices, 
+        mid: currentTileMidIndices, 
+        top: currentTileTopIndices 
+    });
+  });
+
+  // --- Build index arrays for walls (including bevels) and roofs ---
   const wallIndices = [];
   const roofIndices = [];
 
-  // --- Walls: for each tile, connect base edge → top edge ---
   Object.values(tilesData).forEach(tile => {
-    if (!tile.vertexOrder || !faceTopIndexMap.has(tile)) {
-      console.warn("Skipping wall generation for a tile due to missing vertexOrder or top indices", tile);
+    const rings = tileRingIndices.get(tile);
+    if (!rings || !rings.base || !rings.mid || !rings.top || 
+        rings.base.length === 0 || rings.mid.length === 0 || rings.top.length === 0) {
+      console.warn("Skipping face generation for a tile due to missing/incomplete ring indices", tile);
       return;
     }
-    const baseIdx = tile.vertexOrder;               // e.g. [i0, i1, i2, i3]
-    const topIdx  = faceTopIndexMap.get(tile);      // e.g. [i4, i5, i6, i7]
 
-    if (baseIdx.length !== topIdx.length) {
-        console.warn("Skipping wall for tile: baseIdx and topIdx length mismatch.", tile, baseIdx, topIdx);
+    const baseIdx = rings.base;
+    const midIdx = rings.mid;
+    const topIdx = rings.top;
+    const n = tile.vertices.length; // Number of vertices per ring
+
+    if (baseIdx.length !== n || midIdx.length !== n || topIdx.length !== n) {
+        console.warn("Skipping face generation for tile: ring index count mismatch with tile.vertices.length", tile, rings);
         return;
     }
 
-    for (let e = 0; e < baseIdx.length; e++) {
-      const b0 = baseIdx[e];
-      const b1 = baseIdx[(e + 1) % baseIdx.length];
-      const t0 = topIdx[e];
-      const t1 = topIdx[(e + 1) % topIdx.length];
+    // Stitch quads for walls and bevels
+    for (let i = 0; i < n; i++) {
+      const b0 = baseIdx[i];
+      const b1 = baseIdx[(i + 1) % n];
+      const m0 = midIdx[i];
+      const m1 = midIdx[(i + 1) % n];
+      const t0 = topIdx[i];
+      const t1 = topIdx[(i + 1) % n];
 
-      // two triangles per quad‐face edge
-      wallIndices.push(b0, b1, t1);
-      wallIndices.push(b0, t1, t0);
-    }
-  });
+      // a) Bevel quads: base → mid (two triangles per quad)
+      wallIndices.push(b0, b1, m1);
+      wallIndices.push(b0, m1, m0);
 
-  // --- Roofs --- 
-  Object.values(tilesData).forEach(tile => {
-    if (!faceTopIndexMap.has(tile)) {
-        console.warn("Skipping roof generation for a tile due to missing top indices", tile);
-        return;
+      // b) Main wall quads: mid → top (two triangles per quad)
+      wallIndices.push(m0, m1, t1);
+      wallIndices.push(m0, t1, t0);
     }
-    const top_global_indices = faceTopIndexMap.get(tile); // These are already global indices
-    // Assuming tiles are quads, as current code filters for them.
-    // Triangulate quad [0,1,2,3] into (0,1,2) and (0,2,3) using local order of top_global_indices
-    if (top_global_indices.length === 4) { // Explicitly check for quads for safety
-        roofIndices.push(top_global_indices[0], top_global_indices[1], top_global_indices[2]);
-        roofIndices.push(top_global_indices[0], top_global_indices[2], top_global_indices[3]);
+
+    // Triangulate the top ring for the roof
+    const topRingVec2s = topIdx.map(globalIndex => {
+      const x = positions[3 * globalIndex];
+      const y = positions[3 * globalIndex + 1];
+      return new THREE.Vector2(x, y);
+    });
+
+    // Ensure CCW for ShapeUtils.triangulateShape
+    // Note: THREE.ShapeUtils.area calculates signed area. Positive for CCW, negative for CW.
+    if (THREE.ShapeUtils.area(topRingVec2s) < 0) {
+        topRingVec2s.reverse(); 
+        // If triangulation relies on original vertex order mapping, need to adjust.
+        // However, triangulateShape takes the points and returns indices *relative to that input array*.
+        // So, if topRingVec2s is reversed, the local indices from triangulateShape will refer to the reversed order.
+        // We need to map these local indices back to the correct global indices in `topIdx`.
+        // A simple way is to reverse a copy of `topIdx` if `topRingVec2s` was reversed.
+        const topIdxReversed = [...topIdx].reverse(); // Create a reversed copy for mapping
+        const trisLocal = THREE.ShapeUtils.triangulateShape(topRingVec2s, []);
+        trisLocal.forEach(tri => {
+            roofIndices.push(topIdxReversed[tri[0]], topIdxReversed[tri[1]], topIdxReversed[tri[2]]);
+        });
     } else {
-        console.warn("Skipping roof for non-quad tile (top_global_indices.length !== 4):", top_global_indices.length);
-        // For robust general polygon triangulation, use THREE.ShapeUtils.triangulateShape
-        // on the top_global_indices after converting them to Vector2 points if needed,
-        // then remap local triangulated indices back to global top_global_indices.
+        const trisLocal = THREE.ShapeUtils.triangulateShape(topRingVec2s, []);
+        trisLocal.forEach(tri => {
+            roofIndices.push(topIdx[tri[0]], topIdx[tri[1]], topIdx[tri[2]]);
+        });
     }
   });
+  
+  // --- End of new logic for bevels ---
+
 
   const combinedIndices = [...wallIndices, ...roofIndices];
   if (combinedIndices.length === 0) {
       console.warn("No indices generated for dome geometry.");
+      // updateVisibility(); // Already called at the start if exiting early
       return;
   }
 
   console.log(
     'Dome build:',
-    'baseVerts=', baseCount,
-    'topVerts=', (positions.length/3 - baseCount),
+    'baseVerts=', baseVertexCount, // Corrected to baseVertexCount
+    'addedMidTopVerts=', (positions.length/3 - baseVertexCount), // Vertices added for mid and top rings
     'wallTris=', wallIndices.length/3,
     'roofTris=', roofIndices.length/3
   );
@@ -1206,11 +1286,11 @@ function updateDomeGeometry() {
   geom.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(positions), 3));
   geom.setIndex(combinedIndices);
 
-  const wallMat = new THREE.MeshBasicMaterial({ color:0x404040, side:THREE.DoubleSide, name: 'DomeWall' });
+  const wallMat = new THREE.MeshBasicMaterial({ color:0x404040, side:THREE.DoubleSide, name: 'DomeWallAndBevel' }); // Renamed for clarity
   
   const distinctRoofTypeIds = [...new Set(Object.values(tilesData).map(t => t.properties.typeId))].sort((a,b)=>a-b);
   const preparedRoofMats = [];
-  const typeIdToMaterialArrayIndex = {}; // Maps original tile.properties.typeId to index in preparedRoofMats array
+  const typeIdToMaterialArrayIndex = {}; 
   
   distinctRoofTypeIds.forEach((id, arrayIndex) => {
       const colorValue = config.faceColors[id % config.faceColors.length];
@@ -1220,39 +1300,62 @@ function updateDomeGeometry() {
           name: `DomeRoof_Type${id}`
       });
       preparedRoofMats.push(roofMaterial);
-      typeIdToMaterialArrayIndex[id] = arrayIndex; // Store index in the specific preparedRoofMats array
+      typeIdToMaterialArrayIndex[id] = arrayIndex; 
   });
 
   const allMeshMaterials = [wallMat, ...preparedRoofMats];
   domeMeshObject = new THREE.Mesh(geom, allMeshMaterials);
   scene.add(domeMeshObject);
 
-  // Add geometry groups for multi-material mesh
   geom.clearGroups();
   if (wallIndices.length > 0) {
-    geom.addGroup(0, wallIndices.length, 0); // Walls use material at index 0 (wallMat)
+    geom.addGroup(0, wallIndices.length, 0); // Walls and Bevels use material at index 0
   }
   
   let roofStartIndex = wallIndices.length;
+  // Iterate through tiles *in the same order* as roofIndices were generated
+  // to correctly assign material groups for roofs.
   Object.values(tilesData).forEach(tile => {
-    if (faceTopIndexMap.has(tile) && faceTopIndexMap.get(tile).length === 4) { // Only add group if roof was generated
-        const typeId = tile.properties.typeId;
-        const materialArrayIndex = typeIdToMaterialArrayIndex[typeId];
-        if (materialArrayIndex !== undefined) {
-            const roofMaterialOverallIndex = materialArrayIndex + 1; // +1 because wallMat is the first material
-            geom.addGroup(roofStartIndex, 6, roofMaterialOverallIndex); // 6 indices per quad roof
-            roofStartIndex += 6;
+    const rings = tileRingIndices.get(tile);
+    // Check if this tile contributed to roofIndices (i.e., had valid top ring for triangulation)
+    if (rings && rings.top && rings.top.length >= 3) { 
+        // For quads, 2 triangles = 6 indices. For a general n-gon, (n-2) triangles = (n-2)*3 indices.
+        // The old code assumed quads (6 indices). Now it's more general due to ShapeUtils.
+        // We need to know how many indices this specific tile's roof contributed.
+        // This part is tricky if tiles are not uniform (e.g. not all quads).
+        // For now, assuming the triangulation produced a fixed number of tris per tile, or this logic needs adjustment
+        // to precisely match segments of roofIndices to tiles.
+        // A robust way: count indices per tile during roof generation and store it.
+        
+        // Simplified: If a tile has a top ring, it's assumed to have a roof part.
+        // The number of indices per roof polygon (e.g. 6 for a quad) is fixed.
+        // This assumes all roofs that are generated are simple polygons with same number of vertices before triangulation.
+        // The current `performMultigridGeneration` aims for quadrilaterals.
+        
+        const n = rings.top.length; // Number of vertices in the top ring
+        if (n >= 3) { // Only polygons with 3+ vertices can form a roof.
+            const numRoofTrisForThisTile = n - 2; // For a simple polygon
+            const numRoofIndicesForThisTile = numRoofTrisForThisTile * 3;
+
+            if (numRoofIndicesForThisTile > 0) {
+                 const typeId = tile.properties.typeId;
+                 const materialArrayIndex = typeIdToMaterialArrayIndex[typeId];
+                 if (materialArrayIndex !== undefined) {
+                     const roofMaterialOverallIndex = materialArrayIndex + 1; 
+                     geom.addGroup(roofStartIndex, numRoofIndicesForThisTile, roofMaterialOverallIndex);
+                     roofStartIndex += numRoofIndicesForThisTile;
+                 } else {
+                     console.warn("Undefined materialArrayIndex for roof typeId:", typeId);
+                 }
+            }
         }
     }
   });
   
-  geom.computeVertexNormals(); // Compute normals after indices and groups are set
+  geom.computeVertexNormals(); 
 
-  // 4.5  Add edges
-  // Create domeEdgesObject if domeMeshObject and its geometry exist.
-  // Visibility is handled by updateVisibility().
   if (domeMeshObject && domeMeshObject.geometry) { 
-    const edgesGeom = new THREE.EdgesGeometry(domeMeshObject.geometry, 30); // Angle threshold for EdgesGeometry
+    const edgesGeom = new THREE.EdgesGeometry(domeMeshObject.geometry, 30); 
     domeEdgesObject = new THREE.LineSegments(
       edgesGeom,
       new THREE.LineBasicMaterial({ color: 0xffffff, name: 'DomeEdges' })
@@ -1260,8 +1363,8 @@ function updateDomeGeometry() {
     scene.add(domeEdgesObject);
   }
 
-  applyGlobalTransforms(); // Apply transforms to the new dome objects
-  updateVisibility(); // Update visibility status
+  applyGlobalTransforms(); 
+  updateVisibility(); 
 }
 
 // =============================================================================
@@ -1350,14 +1453,25 @@ function setupGUI() {
     domeRadiusController = domeF.add(config, 'domeRadius', 0.1, Math.max(0.2, 3 * initial_r_max_for_gui), 0.1).name('Radius').onFinishChange(updateDomeGeometry);
     domeF.add(config, 'profileType', ['spherical','eased','stepped','cascading']).name('Profile').onFinishChange(updateDomeGeometry);
     stepHeightController = domeF.add(config, 'stepHeight', 0.01, Math.max(0.02, initial_r_max_for_gui), 0.01).name('Step Height').onFinishChange(updateDomeGeometry);
-    domeF.add(config, 'tierCount', 1, 20, 1).name('Tiers (stepped)').onFinishChange(updateDomeGeometry); // Updated name for clarity
-    domeF.add(config, 'tiltDeg', -80, 80, 0.5).name('Tilt ° (not cascading)').onFinishChange(updateDomeGeometry); // Updated name
+    domeF.add(config, 'tierCount', 1, 20, 1).name('Tiers (stepped)').onFinishChange(updateDomeGeometry);
+    domeF.add(config, 'tiltDeg', -80, 80, 0.5).name('Tilt ° (spherical/eased)').onFinishChange(updateDomeGeometry); // Updated name
+    domeF.add(config, 'tiltInnerDeg', -90, 90, 1).name('Inner Tilt ° (stepped/casc.)').onFinishChange(updateDomeGeometry); // Moved & Renamed
+    domeF.add(config, 'tiltOuterDeg', -90, 90, 1).name('Outer Tilt ° (stepped/casc.)').onFinishChange(updateDomeGeometry); // Moved & Renamed
+
+    // --- Bevel GUI (NEW) ---
+    domeF
+      .add(config, 'bevelRatio', 0, 0.5, 0.01)
+        .name('Bevel Ratio')
+        .onFinishChange(updateDomeGeometry);
+    domeF
+      .add(config, 'bevelSteps', 1, 5, 1)
+        .name('Bevel Steps')
+        .onFinishChange(updateDomeGeometry);
+    // --- End Bevel GUI ---
 
     const casF = domeF.addFolder('Cascading Profile Settings');
     casF.add(config, 'cascadeSteps', 1, 50, 1).name('Steps').onFinishChange(updateDomeGeometry);
     casF.add(config, 'cascadeDrop', 0.01, 2, 0.01).name('Drop Factor (× r_max)').onFinishChange(updateDomeGeometry); // Clarified name
-    casF.add(config, 'tiltInnerDeg', -90, 90, 1).name('Inner Tilt °').onFinishChange(updateDomeGeometry); // Clarified name
-    casF.add(config, 'tiltOuterDeg', -90, 90, 1).name('Outer Tilt °').onFinishChange(updateDomeGeometry); // Clarified name
 
     genFolder.open();
     transformFolder.open();
@@ -1473,7 +1587,8 @@ init();
 
 /*
 TODO: Entrypoint
-- Step increase needs to work
 - Bevel
 - Half sphere, quarter sphere.
+- Links with config copy
+- Publishing to site 
 */
