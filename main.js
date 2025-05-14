@@ -1689,6 +1689,5 @@ init();
 
 /*
 TODO: Entrypoint
-- Links with config copy
 - Publishing to site 
 */
