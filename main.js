@@ -206,6 +206,9 @@ const config = {
     // epsilon: 1e-6,          // float, numerical tolerance (fixed, not UI) // Will be replaced by UI version
     // q_offset_epsilon: 1e-4, // float, for Q_point offset. REVERTING to 1e-4. // Will be replaced by UI version
 
+    // --- Drawing Parameters ---
+    maxDrawRadius: 24,       // float, max distance of vertices from origin to be drawn
+
     // --- UI-Exposed Tuning Parameters ---
     vertexMergeDecimals: 9,   // was 7
     epsilon_ui: 1e-9,         // was 1e-6
@@ -242,6 +245,9 @@ const config = {
     cascadeDrop: 0.6,
     tiltInnerDeg: 55,
     tiltOuterDeg: 10,
+
+    // --- Color Scheme Parameters ---
+    globalHueShift: 0.0, // 0.0 to 1.0, maps to 0-360 degrees
 };
 
 // --- Global Three.js Variables ---
@@ -255,6 +261,9 @@ let gui;
 let tilesData = {};
 let uniqueVertexMap = new Map(); // Used for unique dual vertices for Points object
 let indexedPositions = [];   // Will store unique dual vertex positions
+
+// --- Base HSL colors for hue shifting ---
+let baseFaceColorsHSL = [];
 
 // --- PRNG instance ---
 let prng;
@@ -493,6 +502,9 @@ function performMultigridGeneration() {
                     const x = (val_i * n_j.y - val_j * n_i.y) / den;
                     const y = (val_j * n_i.x - val_i * n_j.x) / den;
 
+                    // Filter vertices beyond maxDrawRadius
+                    if (Math.hypot(x, y) > config.maxDrawRadius) continue;
+
                     // Point-clip: Compare world-scaled grid coordinates to world limits
                     const clipMargin = 4; // Widened margin
                     if (Math.abs(x * config.zeta) > halfWidthWorld_clip + clipMargin ||
@@ -615,19 +627,20 @@ function performMultigridGeneration() {
         if (temp_debug_counter_step7 <= 5) {
             console.log(`  D_vertices_vec2.length: ${D_vertices_vec2.length}`);
         }
-        // --- USER MODIFICATION: Enforce 4-vertex polygons (quadrilaterals) ---
-        // --- 7.5 Store only tiles that naturally result in 4 vertices ---
 
-        const rawVCount = D_vertices_vec2.length; // Renamed from vCount
+        // Filter dual vertices by config.maxDrawRadius before deduplication
+        const D_vertices_vec2_filtered = D_vertices_vec2.filter(
+            dv => Math.hypot(dv.x, dv.y) <= config.maxDrawRadius
+        );
 
-        if (temp_debug_counter_step7 <= 5) { // Debug log
-            console.log(`  D_vertices_vec2.length (raw, before de-duplication and check): ${rawVCount}`); // Use rawVCount
+        if (temp_debug_counter_step7 <= 5) {
+            console.log(`  D_vertices_vec2.length (after radius filter): ${D_vertices_vec2_filtered.length}`);
         }
 
         // ↓ NEW CODE:   accept any ≥3-gon, but first de-duplicate vertices
         const uniq = [];
         const seen = new Set();
-        for (const v of D_vertices_vec2) {
+        for (const v of D_vertices_vec2_filtered) { // Use the filtered list
             const key = roundForVertexMerge(v.x) + ',' + roundForVertexMerge(v.y);
             if (!seen.has(key)) {
                 uniq.push(v);
@@ -1282,6 +1295,7 @@ function setupGUI() {
     genFolder.add(config, 'Delta', 0, 1, 0.01).name('Disorder (Δ)').onFinishChange(regen);
     genFolder.add(config, 'seed').name('Random Seed').onFinishChange(regen);
     genFolder.add(config, 'R_param', 1, 200, 1).name('Radius (R lines)').onFinishChange(regen);
+    genFolder.add(config, 'maxDrawRadius', 1, 500, 1).name('Max Draw Radius').onFinishChange(regen);
     // Epsilon is not a UI parameter per spec table 1
 
     const transformFolder = gui.addFolder('Global Transforms (§8)');
@@ -1309,7 +1323,9 @@ function setupGUI() {
         if (mainFacesObject && mainFacesObject.material) mainFacesObject.material.transparent = config.faceOpacity < 1;
     });
 
-    const faceColorsFolder = vizFolder.addFolder('Face Type Colors');
+    vizFolder.add(config, 'globalHueShift', 0, 1, 0.01).name('Global Hue Shift').onFinishChange(applyHueShiftToFaceColors);
+
+    const faceColorsFolder = vizFolder.addFolder('Face Type Colors (Base)'); // Renamed for clarity
     config.faceColors.forEach((color, index) => {
         const colorObject = { color: color }; // lil-gui operates on object properties
         faceColorsFolder.addColor(colorObject, 'color')
@@ -1350,6 +1366,33 @@ function setupGUI() {
     domeF.open(); // Open dome folder by default
 }
 
+function applyHueShiftToFaceColors() {
+    if (!baseFaceColorsHSL || baseFaceColorsHSL.length === 0) {
+        console.warn("Base HSL colors not initialized for hue shift.");
+        return;
+    }
+
+    const tempColor = new THREE.Color();
+    for (let i = 0; i < baseFaceColorsHSL.length; i++) {
+        const baseHSL = baseFaceColorsHSL[i];
+        tempColor.setHSL(baseHSL.h, baseHSL.s, baseHSL.l);
+        
+        // Get current HSL of the tempColor (which is based on baseHSL)
+        let currentHSL = { h: 0, s: 0, l: 0 };
+        tempColor.getHSL(currentHSL);
+
+        // Apply shift
+        let newHue = (currentHSL.h + config.globalHueShift) % 1.0;
+        if (newHue < 0) newHue += 1.0; // Ensure hue is in [0, 1)
+
+        tempColor.setHSL(newHue, currentHSL.s, currentHSL.l);
+        config.faceColors[i] = '#' + tempColor.getHexString();
+    }
+
+    // Refresh objects that use these colors
+    updateMainFacesObject();
+    updateDomeGeometry(); 
+}
 
 // =============================================================================
 // Three.js Scene Initialization & Rendering Loop
@@ -1358,6 +1401,16 @@ function setupGUI() {
 function init() {
     scene = new THREE.Scene();
     // scene.background set by HTML/CSS body style
+
+    // --- Initialize base HSL colors for hue shifting ---
+    const tempColor = new THREE.Color();
+    baseFaceColorsHSL = config.faceColors.map(hexColor => {
+        tempColor.set(hexColor);
+        let hsl = { h: 0, s: 0, l: 0 };
+        tempColor.getHSL(hsl);
+        return hsl;
+    });
+    // --- End HSL initialization ---
 
     camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 5000);
     camera.position.set(0, 0, 150); // Initial distance suitable for R_param around 75
@@ -1417,3 +1470,10 @@ function render() {
 // =============================================================================
 
 init(); 
+
+/*
+TODO: Entrypoint
+- Step increase needs to work
+- Bevel
+- Half sphere, quarter sphere.
+*/
