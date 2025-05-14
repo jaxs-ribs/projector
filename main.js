@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ShapeUtils } from 'three';
+// Use a CDN for BufferGeometryUtils if direct import fails
+import * as BufferGeometryUtils from 'https://cdn.jsdelivr.net/npm/three/examples/jsm/utils/BufferGeometryUtils.js';
 import GUI from 'lil-gui';
 
 // =============================================================================
@@ -143,6 +145,49 @@ function calculatePolygonAngles(polygonVertices) {
     return angles;
 }
 
+// --- Dome Extrusion Utility Functions ---
+function heightProfile(u) {
+  const R = config.domeRadius;
+  u = Math.max(0, Math.min(1, u));
+  switch (config.profileType) {
+    case 'spherical':
+      return R - Math.sqrt(Math.max(0, R*R - (u*r_max)**2));
+    case 'eased':
+      return R * u * u;
+    case 'stepped':
+      const tier = Math.floor(config.tierCount * u);
+      return Math.min(R, config.stepHeight * tier);
+    case 'cascading':
+      const k = config.cascadeSteps;
+      const stepId = Math.min(k-1, Math.floor(u * k));
+      const dz = config.cascadeDrop * r_max / k;
+      return dz * stepId;
+    default:
+      return 0;
+  }
+}
+
+function faceTiltDeg(u) {
+  if (config.profileType !== 'cascading') return config.tiltDeg;
+  // interpolate between inner and outer tilts
+  const t0 = config.tiltInnerDeg, t1 = config.tiltOuterDeg;
+  u = Math.max(0, Math.min(1, u));
+  return t1 + (t0 - t1)*(1 - u);
+}
+
+// quaternion to tilt a face toward the origin by angleRad
+function getTiltQuaternion(centroid, angleRad) {
+  const q = new THREE.Quaternion();
+  if (Math.abs(angleRad) < 1e-6) return q;
+  // direction from centroid to origin
+  const d = new THREE.Vector3(-centroid.x, -centroid.y, 0).normalize();
+  if (d.lengthSq() < 1e-12) return q;
+  // rotation axis = d × z-axis
+  const axis = new THREE.Vector3(d.y, -d.x, 0).normalize();
+  return q.setFromAxisAngle(axis, angleRad);
+}
+// --- End Dome Extrusion Utility Functions ---
+
 // =============================================================================
 // Configuration & Global State (Revision 2)
 // =============================================================================
@@ -185,6 +230,18 @@ const config = {
         '#7fffff',
         '#99ffff'  // Lightest Cyan
     ], // Default 12 shades of cyan for face types
+
+    // --- Dome Extrusion Parameters ---
+    extrudeDome: false,
+    domeRadius: 6.0,
+    profileType: 'spherical',    // ['spherical','eased','stepped','cascading']
+    tierCount: 5,
+    stepHeight: 1.0,
+    tiltDeg: 0.0,
+    cascadeSteps: 12,
+    cascadeDrop: 0.6,
+    tiltInnerDeg: 55,
+    tiltOuterDeg: 10,
 };
 
 // --- Global Three.js Variables ---
@@ -201,6 +258,17 @@ let indexedPositions = [];   // Will store unique dual vertex positions
 
 // --- PRNG instance ---
 let prng;
+
+// --- Max radius of dual vertices ---
+let r_max = 0;
+
+// --- Dome geometry objects ---
+let domeMeshObject = null;
+let domeEdgesObject = null;
+
+// --- GUI Controllers for dynamic updates ---
+let domeRadiusController = null;
+let stepHeightController = null;
 
 // Scratch objects
 const _vec2_1 = new THREE.Vector2();
@@ -580,7 +648,7 @@ function performMultigridGeneration() {
         // Now, we handle any polygon with vCount >= 3.
         // The area calculation using Shoelace formula is general.
         let area = 0;
-        for (let k = 0; k < vCount; k++) { // Use vCount (length of uniq)
+        for (let k = 0; k < vCount; k++) {
             const p = uniq[k];
             const q = uniq[(k + 1) % vCount]; // Loop correctly for any vCount
             area += p.x * q.y - p.y * q.x;
@@ -645,15 +713,44 @@ function performMultigridGeneration() {
     });
     console.log('Populated dual vertices for visualization: ' + (indexedPositions.length / 3) + ' unique points.');
 
+    // 1. For every tile, record its base‐vertex indices (vertexOrder)
+    Object.values(tilesData).forEach(tile => {
+      tile.vertexOrder = tile.vertices.map(v => { // tile.vertices are {x,y} objects
+        const key = roundForVertexMerge(v.x) + "," + roundForVertexMerge(v.y);
+        return uniqueVertexMap.get(key);  // global index into indexedPositions
+      });
+    });
+
     // Mesh and face generation (formerly Step 9 and updateMainMeshObject call) removed.
 
     const totalEndTime = performance.now();
     console.log('Full multigrid generation finished in ' + (totalEndTime - startTime).toFixed(2) + ' ms.');
     console.info('Multigrid summary: Dual Polygons (quads): ' + Object.keys(tilesData).length + ', Unique Dual Vertices: ' + uniqueVertexMap.size);
 
+    // --- Compute r_max from dual vertices ---
+    r_max = 0; // Reset r_max for the current generation
+    uniqueVertexMap.forEach((idx, key) => {
+        const [x,y] = key.split(',').map(Number);
+        r_max = Math.max(r_max, Math.hypot(x, y));
+    });
+    console.log("r_max =", r_max);
+    // --- End r_max computation ---
+
+    // --- Update GUI slider ranges that depend on r_max ---
+    if (domeRadiusController) {
+        domeRadiusController.max(Math.max(0.2, 3 * r_max)); // Ensure max is not less than min (0.1)
+        domeRadiusController.updateDisplay();
+    }
+    if (stepHeightController) {
+        stepHeightController.max(Math.max(0.02, r_max)); // Ensure max is not less than min (0.01)
+        stepHeightController.updateDisplay();
+    }
+    // --- End GUI slider update ---
+
     updateVertexPointsObject(); // Create/update vertex points object
     updateMainEdgesObject(); // Create/update main edges object
     updateMainFacesObject();   // NEW – build / refresh face mesh
+    updateDomeGeometry();      // NEW - build / refresh dome if enabled
 }
 
 function clearGeometry() {
@@ -809,57 +906,82 @@ function updateMainFacesObject() {
 
     if (!config.showFaces || Object.keys(tilesData).length === 0) return;
 
-    // ----- collect triangles -----
-    const positions = [];   // Float32Array later
-    const indices   = [];   // Uint32Array later
-    const colors    = [];   // per-vertex colour (optional)
+    // 1) build a global vertex-to-index map
+    // The key now includes typeId to differentiate vertices for coloring
+    const globalVertexMap = new Map();
+    const uniquePositions = [];
+    const uniqueColors    = [];
 
-    const tmpV2   = new THREE.Vector2();
-    const vertCol = new THREE.Color();
-
-    let base = 0;
+    let nextIndex = 0;
     for (const tile of Object.values(tilesData)) {
+        const typeId = tile.properties.typeId !== undefined ? tile.properties.typeId : 0;
+        const colorValue = config.faceColors[typeId % config.faceColors.length];
+        const color = new THREE.Color(colorValue);
 
-        // 1 – ensure CCW winding
-        let verts2 = tile.vertices.map(v => new THREE.Vector2(v.x, v.y));
-        let area   = THREE.ShapeUtils.area(verts2);
-        if (area < 0) verts2.reverse();
+        for (const v_geom of tile.vertices) { // v_geom is {x, y} from tile.vertices
+            const posKeyPart = roundForVertexMerge(v_geom.x) + ',' + roundForVertexMerge(v_geom.y);
+            const fullKey = posKeyPart + '_type_' + typeId;
 
-        // 2 – triangulate
-        const tris = THREE.ShapeUtils.triangulateShape(verts2, []);
-
-        // 3 – push vertex data
-        for (const v of verts2) {
-            positions.push(v.x, v.y, 0);
-            // simple colouring: based on number of sides
-            const typeId = tile.properties.typeId !== undefined ? tile.properties.typeId : 0; // Default to type 0 if undefined
-            vertCol.set(config.faceColors[typeId % config.faceColors.length]); // Use typeId, ensure it wraps around if somehow larger
-            colors.push(vertCol.r, vertCol.g, vertCol.b);
+            if (!globalVertexMap.has(fullKey)) {
+                globalVertexMap.set(fullKey, nextIndex++);
+                uniquePositions.push(v_geom.x, v_geom.y, 0);
+                uniqueColors.push(color.r, color.g, color.b);
+            }
         }
-
-        // 4 – push indices
-        for (const tri of tris) {
-            indices.push(base + tri[0], base + tri[1], base + tri[2]);
-        }
-        base += verts2.length;
     }
 
-    // ----- build geometry -----
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geo.setAttribute('color',    new THREE.Float32BufferAttribute(colors, 3));
-    geo.setIndex(indices);
-    geo.computeVertexNormals();
+    // 2) build the big index list
+    const indices = [];
+    for (const tile of Object.values(tilesData)) {
+        const typeId = tile.properties.typeId !== undefined ? tile.properties.typeId : 0;
+        
+        // Vertices of the current tile, used for triangulation
+        let verts_for_triangulation = tile.vertices.map(v => new THREE.Vector2(v.x, v.y));
+        
+        // Ensure CCW for ShapeUtils.triangulateShape
+        // Note: if tile.vertices could form a self-intersecting polygon, triangulation might be unpredictable.
+        // Assuming simple polygons from the upstream algorithm.
+        if (THREE.ShapeUtils.area(verts_for_triangulation) < 0) {
+            verts_for_triangulation.reverse();
+        }
+        
+        const tris = THREE.ShapeUtils.triangulateShape(verts_for_triangulation, []);
 
-    // ----- material & mesh -----
+        for (const tri of tris) { // tri is [local_idx0, local_idx1, local_idx2] referring to verts_for_triangulation
+            const tri_global_indices = tri.map(local_idx_in_tile => {
+                const v_from_tile_for_key = verts_for_triangulation[local_idx_in_tile]; // This is a THREE.Vector2
+                const posKeyPart = roundForVertexMerge(v_from_tile_for_key.x) + ',' + roundForVertexMerge(v_from_tile_for_key.y);
+                const fullKey = posKeyPart + '_type_' + typeId; // Use current tile's typeId for the key
+                return globalVertexMap.get(fullKey);
+            });
+            indices.push(tri_global_indices[0], tri_global_indices[1], tri_global_indices[2]);
+        }
+    }
+
+    // 3) build one indexed geometry
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(uniquePositions, 3));
+    geo.setAttribute('color',    new THREE.Float32BufferAttribute(uniqueColors, 3));
+    geo.setIndex(indices);
+
+    console.log(`Vertex count before mergeVertices: ${geo.attributes.position.count}`);
+
+    // optional: remove any near-duplicates one last time
+    // This will merge vertices if position AND color (and other attributes) are identical.
+    const merged = BufferGeometryUtils.mergeVertices(geo, config.epsilon_ui); // Use UI epsilon for merging
+    
+    console.log(`Vertex count after mergeVertices: ${merged.attributes.position.count}`);
+    
+    merged.computeVertexNormals();
+
+    // 4) single mesh
     const mat = new THREE.MeshBasicMaterial({
         vertexColors: true,
         transparent:  config.faceOpacity < 1,
         opacity:      config.faceOpacity,
         side:         THREE.DoubleSide
     });
-
-    mainFacesObject = new THREE.Mesh(geo, mat);
+    mainFacesObject = new THREE.Mesh(merged, mat);
     scene.add(mainFacesObject);
 
     // ----- apply global transforms -----
@@ -901,20 +1023,233 @@ function applyGlobalTransforms() {
         mainFacesObject.scale.set(config.zeta, config.zeta, config.zeta);
         mainFacesObject.position.set(config.panX, config.panY, 0);
     }
+
+    if (domeMeshObject) {
+        domeMeshObject.rotation.set(0,0,0);
+        domeMeshObject.scale.set(1,1,1);
+        domeMeshObject.position.set(0,0,0);
+        domeMeshObject.rotation.z = THREE.MathUtils.degToRad(config.alpha_rot);
+        domeMeshObject.scale.set(config.zeta, config.zeta, config.zeta);
+        domeMeshObject.position.set(config.panX, config.panY, 0);
+    }
+
+    if (domeEdgesObject) {
+        domeEdgesObject.rotation.set(0,0,0);
+        domeEdgesObject.scale.set(1,1,1);
+        domeEdgesObject.position.set(0,0,0);
+        domeEdgesObject.rotation.z = THREE.MathUtils.degToRad(config.alpha_rot);
+        domeEdgesObject.scale.set(config.zeta, config.zeta, config.zeta);
+        domeEdgesObject.position.set(config.panX, config.panY, 0);
+    }
 }
 
 function updateVisibility() {
+    const showD = config.extrudeDome;
+
     if (mainVertexPointsObject) {
-        mainVertexPointsObject.visible = config.showVertices;
+        mainVertexPointsObject.visible = config.showVertices && !showD;
     }
     if (mainEdgesObject) {
-        mainEdgesObject.visible = config.showEdges;
+        mainEdgesObject.visible = config.showEdges && !showD;
     }
     if (mainFacesObject) {
-        mainFacesObject.visible = config.showFaces;
+        mainFacesObject.visible = config.showFaces && !showD;
+    }
+
+    if (domeMeshObject) {
+        domeMeshObject.visible = config.showFaces && showD;
+    }
+    if (domeEdgesObject) {
+        domeEdgesObject.visible = config.showEdges && showD;
     }
 }
 
+function updateDomeGeometry() {
+  // 4.1  Dispose previous dome
+  [domeMeshObject, domeEdgesObject].forEach(obj => {
+    if (obj) {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) {
+        if (Array.isArray(obj.material)) {
+          obj.material.forEach(mat => mat.dispose());
+        } else {
+          obj.material.dispose();
+        }
+      }
+      scene.remove(obj);
+    }
+  });
+  domeMeshObject = domeEdgesObject = null;
+  
+  if (!config.extrudeDome || !tilesData || Object.keys(tilesData).length === 0 || r_max === 0) {
+    updateVisibility(); // Ensure dome objects are hidden if they were visible
+    return;
+  }
+
+  // 4.2  Build combined position buffer
+  const baseCount = indexedPositions.length / 3; // Number of unique 2D vertices
+  const positions = [...indexedPositions]; // flat [x,y,0,…] from original 2D tiling
+
+  const faceTopIndexMap = new Map(); // Maps tile object to array of its top vertex global indices
+  let topIndex = baseCount; // Start indexing for new top vertices after base vertices
+  
+  Object.values(tilesData).forEach(tile => {
+    const C = tile.properties.centroid; // {x, y}
+    const u = Math.hypot(C.x, C.y) / r_max;
+    const z = heightProfile(u);
+    const tilt = THREE.MathUtils.degToRad(faceTiltDeg(u));
+    const centroidV3 = new THREE.Vector3(C.x, C.y, 0); // Convert to Vector3
+    const q = getTiltQuaternion(centroidV3, tilt);
+
+    const localTopIndices = [];
+    tile.vertices.forEach(v_obj => { // v_obj is {x,y}
+      const p = new THREE.Vector3(v_obj.x, v_obj.y, 0)
+        .sub(new THREE.Vector3(C.x, C.y, 0)) // Translate to origin for rotation
+        .applyQuaternion(q)
+        .add(new THREE.Vector3(C.x, C.y, z)); // Translate back and lift
+      positions.push(p.x, p.y, p.z);
+      localTopIndices.push(topIndex++);
+    });
+    faceTopIndexMap.set(tile, localTopIndices);
+  });
+
+  if (Object.keys(tilesData).length > 0) {
+      const sampleTileKey = Object.keys(tilesData)[0];
+      const sampleTile = tilesData[sampleTileKey];
+      if (sampleTile && sampleTile.properties) { // Ensure sampleTile and its properties exist
+        console.log(
+          'Sample tile centroid:', sampleTile.properties.centroid,
+          '→ top indices:', faceTopIndexMap.get(sampleTile)
+        );
+      }
+  }
+
+  // 4.3  Build index arrays
+  const wallIndices = [];
+  const roofIndices = [];
+
+  // --- Walls: for each tile, connect base edge → top edge ---
+  Object.values(tilesData).forEach(tile => {
+    if (!tile.vertexOrder || !faceTopIndexMap.has(tile)) {
+      console.warn("Skipping wall generation for a tile due to missing vertexOrder or top indices", tile);
+      return;
+    }
+    const baseIdx = tile.vertexOrder;               // e.g. [i0, i1, i2, i3]
+    const topIdx  = faceTopIndexMap.get(tile);      // e.g. [i4, i5, i6, i7]
+
+    if (baseIdx.length !== topIdx.length) {
+        console.warn("Skipping wall for tile: baseIdx and topIdx length mismatch.", tile, baseIdx, topIdx);
+        return;
+    }
+
+    for (let e = 0; e < baseIdx.length; e++) {
+      const b0 = baseIdx[e];
+      const b1 = baseIdx[(e + 1) % baseIdx.length];
+      const t0 = topIdx[e];
+      const t1 = topIdx[(e + 1) % topIdx.length];
+
+      // two triangles per quad‐face edge
+      wallIndices.push(b0, b1, t1);
+      wallIndices.push(b0, t1, t0);
+    }
+  });
+
+  // --- Roofs --- 
+  Object.values(tilesData).forEach(tile => {
+    if (!faceTopIndexMap.has(tile)) {
+        console.warn("Skipping roof generation for a tile due to missing top indices", tile);
+        return;
+    }
+    const top_global_indices = faceTopIndexMap.get(tile); // These are already global indices
+    // Assuming tiles are quads, as current code filters for them.
+    // Triangulate quad [0,1,2,3] into (0,1,2) and (0,2,3) using local order of top_global_indices
+    if (top_global_indices.length === 4) { // Explicitly check for quads for safety
+        roofIndices.push(top_global_indices[0], top_global_indices[1], top_global_indices[2]);
+        roofIndices.push(top_global_indices[0], top_global_indices[2], top_global_indices[3]);
+    } else {
+        console.warn("Skipping roof for non-quad tile (top_global_indices.length !== 4):", top_global_indices.length);
+        // For robust general polygon triangulation, use THREE.ShapeUtils.triangulateShape
+        // on the top_global_indices after converting them to Vector2 points if needed,
+        // then remap local triangulated indices back to global top_global_indices.
+    }
+  });
+
+  const combinedIndices = [...wallIndices, ...roofIndices];
+  if (combinedIndices.length === 0) {
+      console.warn("No indices generated for dome geometry.");
+      return;
+  }
+
+  console.log(
+    'Dome build:',
+    'baseVerts=', baseCount,
+    'topVerts=', (positions.length/3 - baseCount),
+    'wallTris=', wallIndices.length/3,
+    'roofTris=', roofIndices.length/3
+  );
+
+  // 4.4  Create geometry & materials
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(positions), 3));
+  geom.setIndex(combinedIndices);
+
+  const wallMat = new THREE.MeshBasicMaterial({ color:0x404040, side:THREE.DoubleSide, name: 'DomeWall' });
+  
+  const distinctRoofTypeIds = [...new Set(Object.values(tilesData).map(t => t.properties.typeId))].sort((a,b)=>a-b);
+  const preparedRoofMats = [];
+  const typeIdToMaterialArrayIndex = {}; // Maps original tile.properties.typeId to index in preparedRoofMats array
+  
+  distinctRoofTypeIds.forEach((id, arrayIndex) => {
+      const colorValue = config.faceColors[id % config.faceColors.length];
+      const roofMaterial = new THREE.MeshBasicMaterial({
+          color: new THREE.Color(colorValue),
+          side: THREE.DoubleSide,
+          name: `DomeRoof_Type${id}`
+      });
+      preparedRoofMats.push(roofMaterial);
+      typeIdToMaterialArrayIndex[id] = arrayIndex; // Store index in the specific preparedRoofMats array
+  });
+
+  const allMeshMaterials = [wallMat, ...preparedRoofMats];
+  domeMeshObject = new THREE.Mesh(geom, allMeshMaterials);
+  scene.add(domeMeshObject);
+
+  // Add geometry groups for multi-material mesh
+  geom.clearGroups();
+  if (wallIndices.length > 0) {
+    geom.addGroup(0, wallIndices.length, 0); // Walls use material at index 0 (wallMat)
+  }
+  
+  let roofStartIndex = wallIndices.length;
+  Object.values(tilesData).forEach(tile => {
+    if (faceTopIndexMap.has(tile) && faceTopIndexMap.get(tile).length === 4) { // Only add group if roof was generated
+        const typeId = tile.properties.typeId;
+        const materialArrayIndex = typeIdToMaterialArrayIndex[typeId];
+        if (materialArrayIndex !== undefined) {
+            const roofMaterialOverallIndex = materialArrayIndex + 1; // +1 because wallMat is the first material
+            geom.addGroup(roofStartIndex, 6, roofMaterialOverallIndex); // 6 indices per quad roof
+            roofStartIndex += 6;
+        }
+    }
+  });
+  
+  geom.computeVertexNormals(); // Compute normals after indices and groups are set
+
+  // 4.5  Add edges
+  // Create domeEdgesObject if domeMeshObject and its geometry exist.
+  // Visibility is handled by updateVisibility().
+  if (domeMeshObject && domeMeshObject.geometry) { 
+    const edgesGeom = new THREE.EdgesGeometry(domeMeshObject.geometry, 30); // Angle threshold for EdgesGeometry
+    domeEdgesObject = new THREE.LineSegments(
+      edgesGeom,
+      new THREE.LineBasicMaterial({ color: 0xffffff, name: 'DomeEdges' })
+    );
+    scene.add(domeEdgesObject);
+  }
+
+  applyGlobalTransforms(); // Apply transforms to the new dome objects
+  updateVisibility(); // Update visibility status
+}
 
 // =============================================================================
 // User Interface Setup (lil-gui)
@@ -942,18 +1277,18 @@ function setupGUI() {
     };
 
     const genFolder = gui.addFolder('Generation Parameters (§1)');
-    genFolder.add(config, 'N', 3, 33, 1).name('Symmetry (N)').onChange(regen);
-    genFolder.add(config, 'phi', 0, 0.9999, 0.001).name('Phase (φ)').onChange(regen); // Max < 1
-    genFolder.add(config, 'Delta', 0, 1, 0.01).name('Disorder (Δ)').onChange(regen);
+    genFolder.add(config, 'N', 3, 33, 1).name('Symmetry (N)').onFinishChange(regen);
+    genFolder.add(config, 'phi', 0, 0.9999, 0.001).name('Phase (φ)').onFinishChange(regen); // Max < 1
+    genFolder.add(config, 'Delta', 0, 1, 0.01).name('Disorder (Δ)').onFinishChange(regen);
     genFolder.add(config, 'seed').name('Random Seed').onFinishChange(regen);
-    genFolder.add(config, 'R_param', 1, 200, 1).name('Radius (R lines)').onChange(regen);
+    genFolder.add(config, 'R_param', 1, 200, 1).name('Radius (R lines)').onFinishChange(regen);
     // Epsilon is not a UI parameter per spec table 1
 
     const transformFolder = gui.addFolder('Global Transforms (§8)');
-    transformFolder.add(config, 'alpha_rot', -360, 360, 1).name('Rotation (α deg)').onChange(updateTransforms);
-    transformFolder.add(config, 'zeta', 0.01, 10, 0.01).name('Zoom (ζ)').onChange(updateTransforms);
-    transformFolder.add(config, 'panX', -100, 100, 0.1).name('Pan X (p.x)').onChange(updateTransforms);
-    transformFolder.add(config, 'panY', -100, 100, 0.1).name('Pan Y (p.y)').onChange(updateTransforms);
+    transformFolder.add(config, 'alpha_rot', -360, 360, 1).name('Rotation (α deg)').onFinishChange(updateTransforms);
+    transformFolder.add(config, 'zeta', 0.01, 10, 0.01).name('Zoom (ζ)').onFinishChange(updateTransforms);
+    transformFolder.add(config, 'panX', -100, 100, 0.1).name('Pan X (p.x)').onFinishChange(updateTransforms);
+    transformFolder.add(config, 'panY', -100, 100, 0.1).name('Pan Y (p.y)').onFinishChange(updateTransforms);
 
     const vizFolder = gui.addFolder('Visualization (§9)');
     vizFolder.add(config, 'showVertices').name('Show Vertices').onChange(() => {
@@ -968,7 +1303,7 @@ function setupGUI() {
         updateMainFacesObject(); // create/destroy
         updateVisibility();      // then apply flag
     });
-    vizFolder.add(config, 'faceOpacity', 0.05, 1, 0.05).name('Face Opacity').onChange(() => {
+    vizFolder.add(config, 'faceOpacity', 0.05, 1, 0.05).name('Face Opacity').onFinishChange(() => {
         if (mainFacesObject && mainFacesObject.material) mainFacesObject.material.opacity = config.faceOpacity;
         // Also need to update transparency flag if opacity hits 1 or drops below 1
         if (mainFacesObject && mainFacesObject.material) mainFacesObject.material.transparent = config.faceOpacity < 1;
@@ -990,10 +1325,29 @@ function setupGUI() {
     tuningFolder.add(config, 'epsilon_ui', 1e-8, 1e-3, 1e-7).name('Numeric Tolerance (ε)').onFinishChange(regen);
     tuningFolder.add(config, 'q_offset_epsilon_ui', 1e-6, 1e-1, 1e-5).name('Q Offset (εQ)').onFinishChange(regen);
 
+    // --- Dome Extrusion GUI --- 
+    const initial_r_max_for_gui = config.R_param > 0 ? config.R_param : 20; // Default if R_param is 0
+
+    const domeF = gui.addFolder('Dome Extrusion');
+    domeF.add(config, 'extrudeDome').name('Enable Dome').onChange(updateDomeGeometry);
+    
+    domeRadiusController = domeF.add(config, 'domeRadius', 0.1, Math.max(0.2, 3 * initial_r_max_for_gui), 0.1).name('Radius').onFinishChange(updateDomeGeometry);
+    domeF.add(config, 'profileType', ['spherical','eased','stepped','cascading']).name('Profile').onFinishChange(updateDomeGeometry);
+    stepHeightController = domeF.add(config, 'stepHeight', 0.01, Math.max(0.02, initial_r_max_for_gui), 0.01).name('Step Height').onFinishChange(updateDomeGeometry);
+    domeF.add(config, 'tierCount', 1, 20, 1).name('Tiers (stepped)').onFinishChange(updateDomeGeometry); // Updated name for clarity
+    domeF.add(config, 'tiltDeg', -80, 80, 0.5).name('Tilt ° (not cascading)').onFinishChange(updateDomeGeometry); // Updated name
+
+    const casF = domeF.addFolder('Cascading Profile Settings');
+    casF.add(config, 'cascadeSteps', 1, 50, 1).name('Steps').onFinishChange(updateDomeGeometry);
+    casF.add(config, 'cascadeDrop', 0.01, 2, 0.01).name('Drop Factor (× r_max)').onFinishChange(updateDomeGeometry); // Clarified name
+    casF.add(config, 'tiltInnerDeg', -90, 90, 1).name('Inner Tilt °').onFinishChange(updateDomeGeometry); // Clarified name
+    casF.add(config, 'tiltOuterDeg', -90, 90, 1).name('Outer Tilt °').onFinishChange(updateDomeGeometry); // Clarified name
+
     genFolder.open();
     transformFolder.open();
-    // vizFolder.open(); // Keep closed by default maybe
+    vizFolder.open(); // Let's open this too by default
     tuningFolder.open();
+    domeF.open(); // Open dome folder by default
 }
 
 
